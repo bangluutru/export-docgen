@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Full E2E Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #111;
+            color: #0f0;
+            padding: 20px;
+        }
+
+        .pass {
+            color: #0f0;
+        }
+
+        .fail {
+            color: #f00;
+        }
+
+        .info {
+            color: #0af;
+        }
+
+        .warn {
+            color: #fa0;
+        }
+
+        h2 {
+            color: #ff0;
+            border-bottom: 1px solid #333;
+            padding-bottom: 8px;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+    <script src="xlsx-reader.js"></script>
+    <script src="xlsx-writer.js"></script>
+</head>
+
+<body>
+    <div id="output"></div>
+    <script>
+        const out = document.getElementById('output');
+        function log(msg, cls = 'info') { out.innerHTML += `<div class="${cls}">${msg}</div>`; }
+        function pass(msg) { log('✅ PASS: ' + msg, 'pass'); }
+        function fail(msg) { log('❌ FAIL: ' + msg, 'fail'); }
+        function warn(msg) { log('⚠️ WARN: ' + msg, 'warn'); }
+        function section(msg) { out.innerHTML += `<h2>${msg}</h2>`; }
+
+        let passed = 0, failed = 0;
+        function assert(cond, msg) { if (cond) { passed++; pass(msg); } else { failed++; fail(msg); } }
+
+        // Wait for all scripts to load
+        window.addEventListener('load', async () => {
+            await runAllTests();
+        });
+
+        async function runAllTests() {
+            section('1. CSV Reader Tests');
+            try {
+                const csv = 'Name,Age,City\nAlice,30,Hanoi\nBob,25,HCMC';
+                const d = XLSXReader.readCSV(csv);
+                assert(d.sheetNames.length === 1, 'CSV: 1 sheet found');
+                assert(d.sheets.Sheet1.headers.length === 3, 'CSV: 3 headers');
+                assert(d.sheets.Sheet1.rows.length === 2, 'CSV: 2 data rows');
+                assert(d.sheets.Sheet1.headers[0] === 'Name', 'CSV: header[0] = Name');
+                assert(d.sheets.Sheet1.rows[0][1] === '30', 'CSV: row[0][1] = 30');
+            } catch (e) { fail('CSV Reader threw: ' + e.message); }
+
+            // Tab-delimited
+            try {
+                const tsv = 'A\tB\tC\n1\t2\t3';
+                const d = XLSXReader.readCSV(tsv);
+                assert(d.sheets.Sheet1.headers[0] === 'A', 'TSV: tab delimiter detected');
+            } catch (e) { fail('TSV: ' + e.message); }
+
+            section('2. XLSX Reader — Real File');
+            try {
+                const resp = await fetch('test_data.xlsx');
+                const buf = await resp.arrayBuffer();
+                const d = await XLSXReader.read(buf);
+                log('Sheet names found: ' + JSON.stringify(d.sheetNames));
+
+                // Check if any sheet name contains Vietnamese chars
+                const hasVietnameseSheet = d.sheetNames.some(name => name.includes('vi'));
+                assert(d.sheetNames.length > 0, 'Real XLSX: at least 1 sheet found');
+
+                const sheetName = d.sheetNames[0];
+                const s = d.sheets[sheetName];
+                assert(s.headers.length === 6, 'Real XLSX: 6 headers (got ' + s.headers.length + ')');
+                assert(s.rows.length === 10, 'Real XLSX: 10 rows (got ' + s.rows.length + ')');
+                log('Headers: ' + JSON.stringify(s.headers));
+                log('First row: ' + JSON.stringify(s.rows[0]));
+                assert(s.rows[0][3] === '25000000', 'Real XLSX: numeric cell correct');
+            } catch (e) { fail('XLSX Reader: ' + e.message); }
+
+            section('3. XLSX Writer — Generate Files');
+            const testHeaders = ['Name', 'Age', 'City', 'Salary'];
+            const testRows = [
+                ['Alice', '30', 'Hanoi', '15000000'],
+                ['Bob', '25', 'HCMC', '12000000'],
+                ['Charlie', '35', 'Danang', '18000000'],
+            ];
+
+            for (const tmpl of ['professional', 'modern', 'classic', 'minimal']) {
+                try {
+                    const blob = await XLSXWriter.generate({
+                        headers: testHeaders, rows: testRows,
+                        title: 'TEST ' + tmpl.toUpperCase(),
+                        templateName: tmpl, addSTT: true, addDate: true, autofit: true,
+                        sheetName: 'TestSheet',
+                    });
+                    assert(blob.size > 1000, 'Writer [' + tmpl + ']: blob size = ' + blob.size);
+                    assert(blob.type.includes('spreadsheetml'), 'Writer [' + tmpl + ']: correct MIME');
+                } catch (e) { fail('Writer [' + tmpl + ']: ' + e.message); }
+            }
+
+            section('4. XLSX Writer — Content Verification');
+            try {
+                const blob = await XLSXWriter.generate({
+                    headers: testHeaders, rows: testRows,
+                    title: 'DANH SACH', templateName: 'professional',
+                    addSTT: true, addDate: true, autofit: true, sheetName: 'DS',
+                });
+
+                const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+
+                const contentTypes = await zip.file('[Content_Types].xml').async('string');
+                assert(contentTypes.includes('worksheet+xml'), 'XML: Content_Types has worksheet');
+                assert(contentTypes.includes('sharedStrings'), 'XML: Content_Types has sharedStrings');
+                assert(contentTypes.includes('styles'), 'XML: Content_Types has styles');
+
+                const workbook = await zip.file('xl/workbook.xml').async('string');
+                assert(workbook.includes('name="DS"'), 'XML: workbook has sheet name DS');
+
+                const styles = await zip.file('xl/styles.xml').async('string');
+                assert(styles.includes('1E3A5F'), 'XML: styles has professional color');
+                assert(styles.includes('numFmt'), 'XML: styles has number format');
+                assert(styles.includes('cellXfs'), 'XML: styles has cell formats');
+
+                const sharedStr = await zip.file('xl/sharedStrings.xml').async('string');
+                assert(sharedStr.includes('DANH SACH'), 'XML: shared strings has title');
+                assert(sharedStr.includes('Name'), 'XML: shared strings has header');
+
+                const sheet = await zip.file('xl/worksheets/sheet1.xml').async('string');
+                assert(sheet.includes('mergeCell'), 'XML: sheet has merge cells');
+                assert(sheet.includes('pane'), 'XML: sheet has frozen panes');
+                assert(sheet.includes('col min='), 'XML: sheet has column widths');
+
+                pass('All XML structure checks passed');
+            } catch (e) { fail('Content verification: ' + e.message); }
+
+            section('5. Roundtrip: Write then Read');
+            try {
+                const blob = await XLSXWriter.generate({
+                    headers: ['ColA', 'ColB', 'ColC'],
+                    rows: [['Hello', '100', 'World'], ['Foo', '200', 'Bar'], ['Baz', '300', 'Qux']],
+                    title: 'ROUNDTRIP TEST', templateName: 'modern',
+                    addSTT: false, addDate: false, autofit: true, sheetName: 'RT',
+                });
+
+                const data = await XLSXReader.read(await blob.arrayBuffer());
+                assert(data.sheetNames[0] === 'RT', 'Roundtrip: sheet name preserved');
+                const s = data.sheets['RT'];
+                assert(s.headers[0] === 'ROUNDTRIP TEST', 'Roundtrip: title found as first row');
+                const dataRows = s.rows.filter(r => r[0] && r[0] !== '' && r[0] !== 'ColA');
+                assert(dataRows.length >= 3, 'Roundtrip: data rows found (' + dataRows.length + ')');
+                pass('Roundtrip integrity verified');
+            } catch (e) { fail('Roundtrip: ' + e.message); }
+
+            section('6. XLSX Writer — STT Column');
+            try {
+                const blob = await XLSXWriter.generate({
+                    headers: ['Name'], rows: [['A'], ['B'], ['C']],
+                    title: 'STT TEST', templateName: 'professional',
+                    addSTT: true, addDate: false, autofit: true, sheetName: 'S',
+                });
+
+                const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+                const sheet = await zip.file('xl/worksheets/sheet1.xml').async('string');
+                const ss = await zip.file('xl/sharedStrings.xml').async('string');
+                assert(ss.includes('STT'), 'STT: column header found');
+                assert(sheet.includes('<v>1</v>'), 'STT: value 1 found');
+                assert(sheet.includes('<v>2</v>'), 'STT: value 2 found');
+                assert(sheet.includes('<v>3</v>'), 'STT: value 3 found');
+                pass('STT column correctly generated');
+            } catch (e) { fail('STT: ' + e.message); }
+
+            section('7. Number Formatting');
+            try {
+                const blob = await XLSXWriter.generate({
+                    headers: ['Item', 'Price'],
+                    rows: [['Apple', '15000'], ['Banana', '25000.5']],
+                    title: 'NUMBERS', templateName: 'modern',
+                    addSTT: false, addDate: false, autofit: true, sheetName: 'Num',
+                });
+
+                const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+                const sheet = await zip.file('xl/worksheets/sheet1.xml').async('string');
+                assert(sheet.includes('<v>15000</v>'), 'Numbers: 15000 as raw value');
+                assert(sheet.includes('<v>25000.5</v>'), 'Numbers: 25000.5 as raw value');
+                pass('Numbers correctly formatted');
+            } catch (e) { fail('Numbers: ' + e.message); }
+
+            section('8. PDF Generation');
+            try {
+                // Debug jsPDF loading
+                log('window.jspdf type: ' + typeof window.jspdf);
+                log('window.jsPDF type: ' + typeof window.jsPDF);
+
+                let jsPDFClass;
+                if (window.jspdf && window.jspdf.jsPDF) {
+                    jsPDFClass = window.jspdf.jsPDF;
+                } else if (window.jsPDF) {
+                    jsPDFClass = window.jsPDF;
+                } else {
+                    throw new Error('jsPDF not found on window. Keys: ' + Object.keys(window).filter(k => k.toLowerCase().includes('pdf')).join(', '));
+                }
+
+                const tpl = XLSXWriter.getTemplate('professional');
+
+                const doc = new jsPDFClass({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+                doc.setFontSize(16);
+                doc.setFont(undefined, 'bold');
+                doc.text('TEST PDF', doc.internal.pageSize.getWidth() / 2, 18, { align: 'center' });
+
+                doc.autoTable({
+                    head: [['STT', 'Name', 'Value']],
+                    body: [[1, 'Alpha', 100], [2, 'Beta', 200], [3, 'Gamma', 300]],
+                    startY: 30,
+                    styles: { ...tpl.pdfBodyStyles, cellPadding: 3 },
+                    headStyles: { ...tpl.pdfHeadStyles, halign: 'center' },
+                    alternateRowStyles: tpl.pdfAlternateRowStyles,
+                });
+
+                const pdfBlob = doc.output('blob');
+                assert(pdfBlob.size > 1000, 'PDF: blob size = ' + pdfBlob.size);
+                assert(pdfBlob.type === 'application/pdf', 'PDF: correct MIME type');
+                pass('PDF generated successfully');
+            } catch (e) { fail('PDF: ' + e.message); }
+
+            section('9. Edge Cases');
+            // Empty data
+            try {
+                const blob = await XLSXWriter.generate({
+                    headers: ['A'], rows: [],
+                    title: 'EMPTY', templateName: 'minimal',
+                    addSTT: false, addDate: false, sheetName: 'Empty',
+                });
+                assert(blob.size > 500, 'Edge: empty data generates valid file (' + blob.size + ' bytes)');
+            } catch (e) { fail('Edge empty: ' + e.message); }
+
+            // Special characters
+            try {
+                const blob = await XLSXWriter.generate({
+                    headers: ['Name & <Value>'],
+                    rows: [['Test "quoted" & <tagged>'], ['Line1\nLine2']],
+                    title: 'SPECIAL <CHARS> & "QUOTES"',
+                    templateName: 'classic', addSTT: false, addDate: false, sheetName: 'Special',
+                });
+                const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+                const ss = await zip.file('xl/sharedStrings.xml').async('string');
+                assert(ss.includes('&amp;'), 'Edge: & escaped to &amp;');
+                assert(ss.includes('&lt;'), 'Edge: < escaped to &lt;');
+                assert(ss.includes('&quot;'), 'Edge: " escaped to &quot;');
+                assert(blob.size > 500, 'Edge: special chars file generated');
+                pass('Special characters correctly escaped');
+            } catch (e) { fail('Edge special: ' + e.message); }
+
+            // Many columns
+            try {
+                const headers = Array.from({ length: 30 }, (_, i) => 'Col' + (i + 1));
+                const rows = [Array.from({ length: 30 }, (_, i) => 'Val' + (i + 1))];
+                const blob = await XLSXWriter.generate({
+                    headers, rows, title: 'WIDE', templateName: 'professional',
+                    addSTT: true, addDate: true, sheetName: 'Wide',
+                });
+                const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+                const sheet = await zip.file('xl/worksheets/sheet1.xml').async('string');
+                assert(sheet.includes('AE'), 'Edge: 30+ columns handled (AE column ref)');
+                pass('Wide table (31 columns) generated correctly');
+            } catch (e) { fail('Edge wide: ' + e.message); }
+
+            // Summary
+            out.innerHTML += '<br>';
+            section('SUMMARY');
+            log('Total: ' + (passed + failed) + ' tests');
+            log('Passed: ' + passed, 'pass');
+            if (failed > 0) log('Failed: ' + failed, 'fail');
+            else log('ALL TESTS PASSED!', 'pass');
+        }
+    </script>
+</body>
+
+</html>

@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Excel & PDF Generator — Tạo file theo mẫu</title>
+    <meta name="description"
+        content="Ứng dụng tạo file Excel và PDF theo mẫu từ dữ liệu Excel đầu vào — xử lý hoàn toàn trên trình duyệt">
+
+    <!-- Google Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+
+    <!-- JSZip for ZIP handling (not an Excel library — just ZIP) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- FileSaver for download -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <!-- jsPDF for PDF -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-content">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                            <rect x="2" y="2" width="28" height="28" rx="6" fill="url(#grad1)" />
+                            <path d="M9 10h14M9 16h14M9 22h10" stroke="white" stroke-width="2" stroke-linecap="round" />
+                            <defs>
+                                <linearGradient id="grad1" x1="0" y1="0" x2="32" y2="32">
+                                    <stop offset="0%" style="stop-color:#6366f1" />
+                                    <stop offset="100%" style="stop-color:#8b5cf6" />
+                                </linearGradient>
+                            </defs>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1>Excel & PDF Generator</h1>
+                        <p class="tagline">Tạo file Excel & PDF theo mẫu — Custom Engine</p>
+                    </div>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-ghost" id="btnHelp" title="Hướng dẫn">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <circle cx="12" cy="12" r="10" />
+                            <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
+                            <line x1="12" y1="17" x2="12.01" y2="17" />
+                        </svg>
+                        Hướng dẫn
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+
+            <!-- Step 1: Template Upload -->
+            <section class="step-section" id="stepTemplate">
+                <div class="step-header">
+                    <div class="step-badge">1</div>
+                    <div>
+                        <h2>Tải mẫu định dạng</h2>
+                        <p>Tải lên file Excel mẫu (.xlsx) đã được định dạng chuẩn</p>
+                    </div>
+                </div>
+                <div class="upload-zone" id="templateDropZone">
+                    <input type="file" id="templateFileInput" accept=".xlsx" hidden>
+                    <div class="upload-icon">
+                        <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="1.5">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                            <polyline points="14 2 14 8 20 8" />
+                            <path d="M12 18v-6M9 15l3-3 3 3" />
+                        </svg>
+                    </div>
+                    <p class="upload-text">Kéo thả file mẫu vào đây hoặc <span class="upload-link">click để chọn</span>
+                    </p>
+                    <p class="upload-hint">Chỉ hỗ trợ .xlsx — File mẫu sẽ được phân tích cấu trúc và định dạng</p>
+                </div>
+                <!-- Template Info Card -->
+                <div class="template-info-card" id="templateInfoCard" style="display:none">
+                    <div class="template-info-header">
+                        <div class="template-file-info">
+                            <div class="template-icon">
+                                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                    <polyline points="14 2 14 8 20 8" />
+                                </svg>
+                            </div>
+                            <div>
+                                <span class="template-file-name" id="templateFileName"></span>
+                                <span class="template-file-meta" id="templateFileMeta"></span>
+                            </div>
+                        </div>
+                        <div class="template-actions">
+                            <span class="template-status-badge" id="templateStatusBadge">✅ Đã phân tích</span>
+                            <button class="btn btn-ghost btn-sm" id="btnRemoveTemplate" title="Xóa mẫu">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <line x1="18" y1="6" x2="6" y2="18" />
+                                    <line x1="6" y1="6" x2="18" y2="18" />
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="template-details-grid" id="templateDetailsGrid">
+                        <!-- Filled by JS -->
+                    </div>
+                    <div class="template-columns" id="templateColumns">
+                        <!-- Filled by JS: shows detected column headers -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 2: Data Upload -->
+            <section class="step-section disabled-section" id="stepUpload">
+                <div class="step-header">
+                    <div class="step-badge">2</div>
+                    <div>
+                        <h2>Nạp dữ liệu</h2>
+                        <p>Tải lên file Excel (.xlsx) hoặc CSV chứa dữ liệu cần đưa vào mẫu</p>
+                    </div>
+                </div>
+                <div class="upload-zone" id="dropZone">
+                    <input type="file" id="fileInput" accept=".xlsx,.csv" hidden>
+                    <div class="upload-icon">
+                        <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="1.5">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="17 8 12 3 7 8" />
+                            <line x1="12" y1="3" x2="12" y2="15" />
+                        </svg>
+                    </div>
+                    <p class="upload-text">Kéo thả file dữ liệu vào đây hoặc <span class="upload-link">click để
+                            chọn</span></p>
+                    <p class="upload-hint">Hỗ trợ: .xlsx, .csv — Tối đa 10MB</p>
+                </div>
+                <div class="file-info" id="fileInfo" style="display:none">
+                    <div class="file-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                            <polyline points="14 2 14 8 20 8" />
+                        </svg>
+                    </div>
+                    <div class="file-details">
+                        <span class="file-name" id="fileName"></span>
+                        <span class="file-size" id="fileSize"></span>
+                    </div>
+                    <button class="btn btn-ghost btn-sm" id="btnRemoveFile" title="Xóa file">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18" />
+                            <line x1="6" y1="6" x2="18" y2="18" />
+                        </svg>
+                    </button>
+                </div>
+            </section>
+
+            <!-- Step 3: Config & Export -->
+            <section class="step-section disabled-section" id="stepConfig">
+                <div class="step-header">
+                    <div class="step-badge">3</div>
+                    <div>
+                        <h2>Cấu hình & Xuất file</h2>
+                        <p>Tùy chỉnh và tải xuống file theo mẫu đã chọn</p>
+                    </div>
+                </div>
+
+                <div class="config-grid">
+                    <div class="config-card">
+                        <h3>📑 Chọn Sheet dữ liệu</h3>
+                        <select id="sheetSelect" class="form-select"></select>
+                    </div>
+
+                    <div class="config-card">
+                        <h3>📐 Khổ giấy PDF</h3>
+                        <select id="pageSize" class="form-select">
+                            <option value="a4">A4 (210 × 297 mm)</option>
+                            <option value="a3">A3 (297 × 420 mm)</option>
+                            <option value="letter">Letter (216 × 279 mm)</option>
+                        </select>
+                        <div class="checkbox-row" style="margin-top: 12px;">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="landscape">
+                                <span>Ngang (Landscape)</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Column Mapping (shown when template is loaded) -->
+                    <div class="config-card span-2" id="columnMappingCard" style="display:none">
+                        <h3>🔗 Ghép cột dữ liệu → Mẫu</h3>
+                        <p class="mapping-hint">Chọn cột dữ liệu tương ứng với mỗi cột trong mẫu</p>
+                        <div class="mapping-grid" id="mappingGrid">
+                            <!-- Filled by JS -->
+                        </div>
+                    </div>
+
+                    <!-- Built-in template options (shown when NO template loaded) -->
+                    <div class="config-card span-2" id="builtinTemplateCard">
+                        <h3>🎨 Kiểu mẫu có sẵn</h3>
+                        <p class="mapping-hint" style="margin-bottom:12px;">Không có file mẫu — sử dụng mẫu có sẵn</p>
+                        <div class="template-options">
+                            <label class="template-option selected" data-template="professional">
+                                <input type="radio" name="template" value="professional" checked>
+                                <div class="template-preview tp-professional">
+                                    <div class="tp-header"></div>
+                                    <div class="tp-row"></div>
+                                    <div class="tp-row alt"></div>
+                                    <div class="tp-row"></div>
+                                </div>
+                                <span>Chuyên nghiệp</span>
+                            </label>
+                            <label class="template-option" data-template="modern">
+                                <input type="radio" name="template" value="modern">
+                                <div class="template-preview tp-modern">
+                                    <div class="tp-header"></div>
+                                    <div class="tp-row"></div>
+                                    <div class="tp-row alt"></div>
+                                    <div class="tp-row"></div>
+                                </div>
+                                <span>Hiện đại</span>
+                            </label>
+                            <label class="template-option" data-template="classic">
+                                <input type="radio" name="template" value="classic">
+                                <div class="template-preview tp-classic">
+                                    <div class="tp-header"></div>
+                                    <div class="tp-row"></div>
+                                    <div class="tp-row alt"></div>
+                                    <div class="tp-row"></div>
+                                </div>
+                                <span>Cổ điển</span>
+                            </label>
+                            <label class="template-option" data-template="minimal">
+                                <input type="radio" name="template" value="minimal">
+                                <div class="template-preview tp-minimal">
+                                    <div class="tp-header"></div>
+                                    <div class="tp-row"></div>
+                                    <div class="tp-row alt"></div>
+                                    <div class="tp-row"></div>
+                                </div>
+                                <span>Tối giản</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="config-card" id="titleCard">
+                        <h3>📝 Tiêu đề báo cáo</h3>
+                        <input type="text" id="reportTitle" class="form-input" placeholder="Nhập tiêu đề..."
+                            value="BÁO CÁO DỮ LIỆU">
+                    </div>
+
+                    <div class="config-card" id="optionsCard">
+                        <h3>⚙️ Tùy chọn</h3>
+                        <div class="checkbox-row">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="includeSTT" checked>
+                                <span>Thêm cột STT</span>
+                            </label>
+                        </div>
+                        <div class="checkbox-row">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="includeDate" checked>
+                                <span>Thêm ngày xuất</span>
+                            </label>
+                        </div>
+                        <div class="checkbox-row">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="autofitColumns" checked>
+                                <span>Tự động co giãn cột</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Preview & Export -->
+                <div class="preview-toolbar" id="previewToolbar" style="display:none">
+                    <div class="preview-info">
+                        <span id="rowCount">0 dòng</span>
+                        <span class="separator">•</span>
+                        <span id="colCount">0 cột</span>
+                    </div>
+                    <div class="export-buttons">
+                        <button class="btn btn-success" id="btnExportExcel">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                <polyline points="7 10 12 15 17 10" />
+                                <line x1="12" y1="15" x2="12" y2="3" />
+                            </svg>
+                            Tải Excel (.xlsx)
+                        </button>
+                        <button class="btn btn-primary" id="btnExportPDF">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                <polyline points="14 2 14 8 20 8" />
+                                <line x1="16" y1="13" x2="8" y2="13" />
+                                <line x1="16" y1="17" x2="8" y2="17" />
+                            </svg>
+                            Tải PDF
+                        </button>
+                    </div>
+                </div>
+
+                <div class="preview-container" id="previewContainer" style="display:none">
+                    <div class="table-wrapper" id="tableWrapper">
+                        <table class="preview-table" id="previewTable">
+                            <thead id="previewHead"></thead>
+                            <tbody id="previewBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer class="app-footer">
+            <p>Excel & PDF Generator — Custom Engine — Dữ liệu xử lý 100% trên trình duyệt</p>
+        </footer>
+    </div>
+
+    <!-- Help Modal -->
+    <div class="modal-overlay" id="helpModal" style="display:none">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>Hướng dẫn sử dụng</h2>
+                <button class="btn btn-ghost btn-sm modal-close" id="btnCloseHelp">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18" />
+                        <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="help-step">
+                    <div class="help-num">1</div>
+                    <div>
+                        <h3>Tải file mẫu</h3>
+                        <p>Tải lên file Excel (.xlsx) đã được định dạng chuẩn. Ứng dụng sẽ phân tích cấu trúc, kiểu chữ,
+                            màu sắc, viền, merge cells để sử dụng khi xuất file.</p>
+                    </div>
+                </div>
+                <div class="help-step">
+                    <div class="help-num">2</div>
+                    <div>
+                        <h3>Nạp dữ liệu</h3>
+                        <p>Tải lên file Excel hoặc CSV chứa dữ liệu thô. Ghép cột dữ liệu với cột tương ứng trong file
+                            mẫu.</p>
+                    </div>
+                </div>
+                <div class="help-step">
+                    <div class="help-num">3</div>
+                    <div>
+                        <h3>Xuất file</h3>
+                        <p>Nhấn "Tải Excel" — file xuất ra sẽ có định dạng giống hệt file mẫu nhưng nội dung từ file dữ
+                            liệu.</p>
+                    </div>
+                </div>
+                <div class="help-note">
+                    <strong>💡 Mẹo:</strong> Nếu không có file mẫu, bạn vẫn có thể sử dụng 4 mẫu có sẵn (Chuyên nghiệp /
+                    Hiện đại / Cổ điển / Tối giản).
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading -->
+    <div class="loading-overlay" id="loadingOverlay" style="display:none">
+        <div class="loading-spinner">
+            <div class="spinner"></div>
+            <p id="loadingText">Đang xử lý...</p>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- Custom XLSX Engine -->
+    <script src="xlsx-reader.js"></script>
+    <script src="xlsx-writer.js"></script>
+    <script src="template-engine.js"></script>
+    <script src="app.js"></script>
+</body>
+
+</html>

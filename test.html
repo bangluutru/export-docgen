@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Runner</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.2/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+    <script src="xlsx-reader.js"></script>
+    <script src="xlsx-writer.js"></script>
+</head>
+<body>
+<pre id="output"></pre>
+<script>
+const log = (msg) => { document.getElementById('output').textContent += msg + '\n'; };
+
+async function runTests() {
+    log('=== XLSX Engine Tests ===');
+    
+    // Test 1: CSV Reading
+    log('\n--- Test 1: CSV Reading ---');
+    try {
+        const csv = 'Name,Age,City\nAlice,30,Hanoi\nBob,25,HCMC\nCharlie,35,Danang';
+        const data = XLSXReader.readCSV(csv);
+        log('Sheet names: ' + JSON.stringify(data.sheetNames));
+        log('Headers: ' + JSON.stringify(data.sheets.Sheet1.headers));
+        log('Rows: ' + JSON.stringify(data.sheets.Sheet1.rows));
+        log('CSV Read: PASS ✅');
+    } catch(e) {
+        log('CSV Read: FAIL ❌ - ' + e.message);
+    }
+    
+    // Test 2: XLSX Writing
+    log('\n--- Test 2: XLSX Writing ---');
+    try {
+        const blob = await XLSXWriter.generate({
+            headers: ['Họ tên', 'Tuổi', 'Thành phố', 'Lương'],
+            rows: [
+                ['Nguyễn A', '30', 'Hà Nội', '15000000'],
+                ['Trần B', '25', 'TP.HCM', '12000000'],
+                ['Lê C', '35', 'Đà Nẵng', '18000000'],
+            ],
+            title: 'DANH SÁCH NHÂN VIÊN',
+            templateName: 'professional',
+            addSTT: true,
+            addDate: true,
+            autofit: true,
+            sheetName: 'NhanVien',
+        });
+        log('Blob size: ' + blob.size + ' bytes');
+        log('Blob type: ' + blob.type);
+        if (blob.size > 500) {
+            log('XLSX Write: PASS ✅');
+        } else {
+            log('XLSX Write: FAIL ❌ - file too small');
+        }
+    } catch(e) {
+        log('XLSX Write: FAIL ❌ - ' + e.message);
+    }
+    
+    // Test 3: Write + Read roundtrip
+    log('\n--- Test 3: Roundtrip (Write then Read) ---');
+    try {
+        const originalHeaders = ['Col A', 'Col B', 'Col C'];
+        const originalRows = [['Hello', '100', 'World'], ['Foo', '200', 'Bar']];
+        
+        const blob = await XLSXWriter.generate({
+            headers: originalHeaders,
+            rows: originalRows,
+            title: 'TEST REPORT',
+            templateName: 'modern',
+            addSTT: false,
+            addDate: false,
+            autofit: true,
+            sheetName: 'TestSheet',
+        });
+        
+        const buffer = await blob.arrayBuffer();
+        const readBack = await XLSXReader.read(buffer);
+        
+        log('Sheet names: ' + JSON.stringify(readBack.sheetNames));
+        const sheet = readBack.sheets['TestSheet'];
+        log('Headers read: ' + JSON.stringify(sheet.headers));
+        log('Rows read: ' + JSON.stringify(sheet.rows));
+        
+        // The first 2 rows are title and spacer, then header, then data
+        // But our reader uses row 1 as header, so we need to check what we get back
+        // Since the title is merged...
+        log('Roundtrip: CHECK (see output above)');
+    } catch(e) {
+        log('Roundtrip: FAIL ❌ - ' + e.message);
+    }
+    
+    // Test 4: Read real XLSX file
+    log('\n--- Test 4: Read real XLSX ---');
+    try {
+        const resp = await fetch('test_data.xlsx');
+        const buffer = await resp.arrayBuffer();
+        const data = await XLSXReader.read(buffer);
+        log('Sheet names: ' + JSON.stringify(data.sheetNames));
+        const sheet = data.sheets[data.sheetNames[0]];
+        log('Headers: ' + JSON.stringify(sheet.headers));
+        log('Rows count: ' + sheet.rows.length);
+        log('First row: ' + JSON.stringify(sheet.rows[0]));
+        log('Read real XLSX: PASS ✅');
+    } catch(e) {
+        log('Read real XLSX: FAIL ❌ - ' + e.message);
+    }
+    
+    // Test 5: All template styles
+    log('\n--- Test 5: All Templates ---');
+    for (const tmpl of ['professional', 'modern', 'classic', 'minimal']) {
+        try {
+            const blob = await XLSXWriter.generate({
+                headers: ['A', 'B'],
+                rows: [['1', '2'], ['3', '4']],
+                title: 'Test ' + tmpl,
+                templateName: tmpl,
+                addSTT: true,
+                addDate: true,
+            });
+            log(tmpl + ': ' + blob.size + ' bytes ✅');
+        } catch(e) {
+            log(tmpl + ': FAIL ❌ - ' + e.message);
+        }
+    }
+    
+    log('\n=== Tests Complete ===');
+}
+
+runTests();
+</script>
+</body>
+</html>

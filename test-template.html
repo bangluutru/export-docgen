@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Template Engine Test</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <style>
+        body {
+            font-family: monospace;
+            background: #111;
+            color: #eee;
+            padding: 20px;
+        }
+
+        .pass {
+            color: #4f4;
+        }
+
+        .fail {
+            color: #f44;
+        }
+
+        .info {
+            color: #8af;
+        }
+
+        h2 {
+            color: #aaf;
+            margin-top: 20px;
+        }
+
+        pre {
+            background: #222;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 12px;
+        }
+
+        #results {
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Template Engine — Automated Test</h1>
+    <div id="results">Loading...</div>
+
+    <script src="xlsx-reader.js"></script>
+    <script src="xlsx-writer.js"></script>
+    <script src="template-engine.js"></script>
+    <script>
+        (async function () {
+            const out = document.getElementById('results');
+            let passed = 0, failed = 0;
+
+            function log(msg, cls) {
+                const el = document.createElement('div');
+                el.className = cls || '';
+                el.textContent = msg;
+                out.appendChild(el);
+            }
+            function assert(condition, msg) {
+                if (condition) { passed++; log('  ✅ ' + msg, 'pass'); }
+                else { failed++; log('  ❌ ' + msg, 'fail'); }
+            }
+
+            out.innerHTML = '';
+            log('Starting Template Engine tests...\n', 'info');
+
+            // ===== TEST 1: Fetch and analyze the template =====
+            log('━━━ TEST GROUP 1: Template Analysis ━━━', 'info');
+            let templateData, summary;
+            try {
+                const resp = await fetch('/template_mau.xlsx');
+                const buffer = await resp.arrayBuffer();
+                assert(buffer.byteLength > 0, `Template file loaded (${buffer.byteLength} bytes)`);
+
+                templateData = await TemplateEngine.analyzeTemplate(buffer);
+                assert(templateData !== null, 'analyzeTemplate() returned result');
+                assert(templateData.zip !== null, 'Template ZIP stored');
+                assert(templateData.sheets.length > 0, `Detected ${templateData.sheets.length} sheets`);
+                assert(templateData.sharedStrings.length > 0, `Parsed ${templateData.sharedStrings.length} shared strings`);
+
+                summary = TemplateEngine.getTemplateSummary(templateData);
+                assert(summary !== null, 'getTemplateSummary() returned result');
+                assert(summary.sheetCount === 8, `Sheet count = ${summary.sheetCount} (expected 8)`);
+                assert(summary.maxColumns === 8, `Max columns = ${summary.maxColumns} (expected 8)`);
+                assert(summary.dataRowCount > 0, `Data rows detected: ${summary.dataRowCount}`);
+                assert(summary.footerRowCount > 0, `Footer rows detected: ${summary.footerRowCount}`);
+                assert(summary.headerRowCount > 0, `Header rows detected: ${summary.headerRowCount}`);
+                assert(summary.mergeCount > 0, `Merge cells detected: ${summary.mergeCount}`);
+
+                log(`\n  Sheet names: ${summary.sheetNames.join(', ')}`, 'info');
+                log(`  Column headers: ${summary.columnHeaders.join(' | ')}`, 'info');
+
+                // Check column headers content
+                const headers = summary.columnHeaders.filter(h => h.trim().length > 0);
+                assert(headers.length >= 6, `Non-empty column headers: ${headers.length}`);
+                assert(headers.some(h => h.includes('No')), `Found "No." column header`);
+                assert(headers.some(h => h.includes('品名')), `Found "品名" column header`);
+
+            } catch (err) {
+                failed++;
+                log('  ❌ Template analysis failed: ' + err.message, 'fail');
+                log(err.stack, 'fail');
+            }
+
+            // ===== TEST 2: Template Analysis - Zone Detection =====
+            log('\n━━━ TEST GROUP 2: Zone Detection ━━━', 'info');
+            try {
+                const analysis = templateData.analysis;
+                assert(analysis.headerZone !== undefined, 'Header zone detected');
+                assert(analysis.columnHeaderRow !== undefined, 'Column header row detected');
+                assert(analysis.dataZone !== undefined, 'Data zone detected');
+                assert(analysis.footerZone !== undefined, 'Footer zone detected');
+
+                assert(analysis.columnHeaderRow.rowNum === 15, `Header row at row ${analysis.columnHeaderRow.rowNum} (expected 15)`);
+                assert(analysis.dataZone.startRowNum >= 16, `Data starts at row ${analysis.dataZone.startRowNum} (expected >= 16)`);
+                assert(analysis.dataZone.stylePatterns.length > 0, `Style patterns extracted: ${analysis.dataZone.stylePatterns.length}`);
+
+                log(`\n  Header zone: rows 1-${analysis.headerZone.endRow}`, 'info');
+                log(`  Column header: row ${analysis.columnHeaderRow.rowNum}`, 'info');
+                log(`  Data zone: rows ${analysis.dataZone.startRowNum}-${analysis.dataZone.endRowNum}`, 'info');
+                log(`  Footer zone starts at index ${analysis.footerZone.startIdx}`, 'info');
+                log(`  Style patterns: ${analysis.dataZone.stylePatterns.length} patterns`, 'info');
+
+            } catch (err) {
+                failed++;
+                log('  ❌ Zone detection test failed: ' + err.message, 'fail');
+            }
+
+            // ===== TEST 3: Generate from Template =====
+            log('\n━━━ TEST GROUP 3: Generate from Template ━━━', 'info');
+            try {
+                // Create test data
+                const testRows = [
+                    [1, 'Test Product A', 'R1', '500mL', 10, 10, 1500, 15000],
+                    [2, 'Test Product A', 'R2', '500mL', 5, 5, 3000, 15000],
+                    [3, 'Test Product B', 'R1', '1000mL', 20, 20, 800, 16000],
+                    [4, 'Test Product B', 'R2', '1000mL', 10, 10, 1600, 16000],
+                    [5, 'Test Product C', 'R1', '250mL', 15, 15, 2000, 30000],
+                ];
+
+                const blob = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: testRows,
+                    sheetName: 'TestOutput',
+                });
+
+                assert(blob instanceof Blob, 'generateFromTemplate() returned Blob');
+                assert(blob.size > 1000, `Output file size: ${blob.size} bytes`);
+                assert(blob.type.includes('spreadsheet'), `MIME type: ${blob.type}`);
+
+                // Read back the generated file to verify structure
+                const outputBuffer = await blob.arrayBuffer();
+                const outputZip = await JSZip.loadAsync(outputBuffer);
+
+                // Check that key files exist
+                assert(outputZip.file('xl/workbook.xml') !== null, 'Output has workbook.xml');
+                assert(outputZip.file('xl/styles.xml') !== null, 'Output has styles.xml (from template)');
+                assert(outputZip.file('xl/sharedStrings.xml') !== null, 'Output has sharedStrings.xml');
+                assert(outputZip.file('[Content_Types].xml') !== null, 'Output has [Content_Types].xml');
+
+                // Check that the first sheet exists
+                const sheetFile = outputZip.file('xl/worksheets/sheet1.xml');
+                assert(sheetFile !== null, 'Output has sheet1.xml');
+
+                // Parse the output sheet
+                const sheetXml = await sheetFile.async('string');
+                assert(sheetXml.includes('sheetData'), 'Output sheet has sheetData');
+
+                // Check shared strings contains our new data (string values are stored here, not inline)
+                const ssFile = outputZip.file('xl/sharedStrings.xml');
+                const ssXml = await ssFile.async('string');
+                assert(ssXml.includes('Test Product A'), 'Output contains test data "Test Product A" (in shared strings)');
+                assert(ssXml.includes('Test Product B'), 'Output contains test data "Test Product B" (in shared strings)');
+                assert(ssXml.includes('Test Product C'), 'Output contains test data "Test Product C" (in shared strings)');
+
+                // Check specific XML structure
+                assert(sheetXml.includes('mergeCells'), 'Output sheet has merge cells');
+
+                // Check the styles.xml is preserved from template (should be large, ~107KB)
+                const stylesFile = outputZip.file('xl/styles.xml');
+                const stylesXml = await stylesFile.async('string');
+                assert(stylesXml.length > 50000, `Styles preserved from template (${stylesXml.length} chars)`);
+
+                // Verify the output can be read by our reader
+                const readBack = await XLSXReader.read(outputBuffer);
+                assert(readBack !== null, 'XLSXReader can read the output file');
+                assert(readBack.sheetNames.length > 0, `Read back ${readBack.sheetNames.length} sheets`);
+
+                // Check sheet name was updated
+                const wbXml = await outputZip.file('xl/workbook.xml').async('string');
+                assert(wbXml.includes('TestOutput'), 'Sheet name updated to "TestOutput"');
+
+                log(`\n  Output file: ${blob.size} bytes`, 'info');
+                log(`  Styles XML: ${stylesXml.length} chars (preserved from template)`, 'info');
+                log(`  Sheets in output: ${readBack.sheetNames.join(', ')}`, 'info');
+
+            } catch (err) {
+                failed++;
+                log('  ❌ Generate from template failed: ' + err.message, 'fail');
+                log(err.stack, 'fail');
+            }
+
+            // ===== TEST 4: Roundtrip with real data =====
+            log('\n━━━ TEST GROUP 4: Roundtrip Verification ━━━', 'info');
+            try {
+                // Generate with specific data
+                const roundtripData = [];
+                for (let i = 1; i <= 10; i++) {
+                    roundtripData.push([i, `Item ${i}`, 'R1', '100mL', i * 2, i * 2, 1000 + i * 100, (i * 2) * (1000 + i * 100)]);
+                }
+
+                const blob2 = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: roundtripData,
+                    sheetName: 'RoundtripTest',
+                });
+                assert(blob2.size > 0, 'Roundtrip file generated');
+
+                const buf2 = await blob2.arrayBuffer();
+                const readback2 = await XLSXReader.read(buf2);
+                assert(readback2.sheetNames.length >= 1, 'Roundtrip file readable');
+
+                // Check that data rows exist in some form  
+                const firstSheet = readback2.sheets[readback2.sheetNames[0]];
+                assert(firstSheet !== undefined, 'First sheet accessible');
+                assert(firstSheet.rows.length > 0, `Roundtrip has ${firstSheet.rows.length} data rows`);
+
+                log(`\n  Roundtrip output: ${blob2.size} bytes`, 'info');
+                log(`  Read back: ${firstSheet.rows.length} rows`, 'info');
+
+            } catch (err) {
+                failed++;
+                log('  ❌ Roundtrip test failed: ' + err.message, 'fail');
+                log(err.stack, 'fail');
+            }
+
+            // ===== TEST 5: Edge Cases =====
+            log('\n━━━ TEST GROUP 5: Edge Cases ━━━', 'info');
+            try {
+                // Empty data
+                const emptyBlob = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: [],
+                    sheetName: 'EmptyTest',
+                });
+                assert(emptyBlob.size > 0, 'Empty data generates valid file');
+
+                // Single row
+                const singleBlob = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: [[1, 'Single', 'R1', '50mL', 1, 1, 500, 500]],
+                    sheetName: 'SingleRow',
+                });
+                assert(singleBlob.size > 0, 'Single row generates valid file');
+
+                // Special characters in data
+                const specialBlob = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: [
+                        [1, 'Measure ALB <特殊>', 'R1', '1000mL', 5, 5, 1000, 5000],
+                        [2, 'Price & "Quote"', 'R2', '500mL', 3, 3, 2000, 6000],
+                    ],
+                    sheetName: 'SpecialChars',
+                });
+                assert(specialBlob.size > 0, 'Special characters handled');
+
+                // Verify special char file is valid XML
+                const specialBuf = await specialBlob.arrayBuffer();
+                const specialZip = await JSZip.loadAsync(specialBuf);
+                const specialSheet = await specialZip.file('xl/worksheets/sheet1.xml').async('string');
+                // Check that raw & and < are properly escaped
+                assert(!specialSheet.includes('& '), 'XML doesn\'t have unescaped & (all escaped to &amp;)');
+                assert(!specialSheet.includes('<<'), 'XML doesn\'t have unescaped < in data');
+
+            } catch (err) {
+                failed++;
+                log('  ❌ Edge case test failed: ' + err.message, 'fail');
+                log(err.stack, 'fail');
+            }
+
+            // ===== SUMMARY =====
+            log('\n═══════════════════════════════════════', 'info');
+            const total = passed + failed;
+            const pct = total > 0 ? Math.round(passed / total * 100) : 0;
+            if (failed === 0) {
+                log(`✅ ALL ${total} TESTS PASSED! (${pct}%)`, 'pass');
+            } else {
+                log(`⚠️ ${passed}/${total} passed, ${failed} failed (${pct}%)`, 'fail');
+            }
+
+        })();
+    </script>
+</body>
+
+</html>
