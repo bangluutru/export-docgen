@@ -1,10 +1,10 @@
 /**
- * Font Loader — Lazy-loads Noto Sans JP for PDF export
+ * Font Loader — Lazy-loads Noto Sans for PDF export (Vietnamese + Latin support)
  * Font is loaded on-demand (not at page startup) to keep initial load fast.
  * 
  * Strategy:
- * 1. Try to load from local file (NotoSansJP-Regular.ttf)
- * 2. If local fails, load from Google Fonts CDN
+ * 1. Try to load from local file (NotoSans-Regular.ttf)
+ * 2. If local fails, load from CDN
  */
 const FontLoader = (() => {
     let fontDataCache = null; // cached base64 string
@@ -12,16 +12,16 @@ const FontLoader = (() => {
 
     // CDN fallback URL for the font
     const FONT_URLS = [
-        'NotoSansJP-Regular.ttf',  // local
-        'https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-jp@latest/japanese-400-normal.ttf',
+        'NotoSans-Regular.ttf',  // local
+        'https://cdn.jsdelivr.net/fontsource/fonts/noto-sans@latest/vietnamese-400-normal.ttf',
     ];
 
     /**
-     * Load the Noto Sans JP font and return its base64 string.
+     * Load the Noto Sans font and return its base64 string.
      * First call fetches from server; subsequent calls return cache.
      * @returns {Promise<string>} base64-encoded font data
      */
-    async function loadNotoSansJP() {
+    async function loadNotoSans() {
         if (fontDataCache) return fontDataCache;
         if (loadingPromise) return loadingPromise;
 
@@ -57,7 +57,7 @@ const FontLoader = (() => {
                 }
 
                 if (!buffer) {
-                    throw new Error('Could not load Noto Sans JP font from any source');
+                    throw new Error('Could not load Noto Sans font from any source');
                 }
 
                 // Convert ArrayBuffer to base64
@@ -84,17 +84,17 @@ const FontLoader = (() => {
      * @param {jsPDF} doc — jsPDF document
      */
     async function registerFont(doc) {
-        const base64Data = await loadNotoSansJP();
+        const base64Data = await loadNotoSans();
 
         // Register Regular weight
-        doc.addFileToVFS('NotoSansJP-Regular.ttf', base64Data);
-        doc.addFont('NotoSansJP-Regular.ttf', 'NotoSansJP', 'normal');
+        doc.addFileToVFS('NotoSans-Regular.ttf', base64Data);
+        doc.addFont('NotoSans-Regular.ttf', 'NotoSans', 'normal');
 
-        // Register Bold (same variable font — jsPDF will use it for bold style)
-        doc.addFileToVFS('NotoSansJP-Bold.ttf', base64Data);
-        doc.addFont('NotoSansJP-Bold.ttf', 'NotoSansJP', 'bold');
+        // Register Bold (use same font for bold — jsPDF will simulate bold)
+        doc.addFileToVFS('NotoSans-Bold.ttf', base64Data);
+        doc.addFont('NotoSans-Bold.ttf', 'NotoSans', 'bold');
 
-        doc.setFont('NotoSansJP', 'normal');
+        doc.setFont('NotoSans', 'normal');
     }
 
     /**
@@ -105,5 +105,5 @@ const FontLoader = (() => {
         return fontDataCache !== null;
     }
 
-    return { loadNotoSansJP, registerFont, isLoaded };
+    return { loadNotoSans, registerFont, isLoaded };
 })();

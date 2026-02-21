@@ -528,7 +528,7 @@
             }
 
             // Title
-            const fontName = (typeof FontLoader !== 'undefined' && FontLoader.isLoaded()) ? 'NotoSansJP' : 'helvetica';
+            const fontName = (typeof FontLoader !== 'undefined' && FontLoader.isLoaded()) ? 'NotoSans' : 'helvetica';
             doc.setFontSize(16);
             doc.setFont(fontName, 'bold');
             const pageWidth = doc.internal.pageSize.getWidth();

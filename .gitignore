@@ -4,7 +4,7 @@ node_modules/
 # Font files (downloaded separately - see setup.sh)
 *.ttf
 # But allow the production font
-!NotoSansJP-Regular.ttf
+!NotoSans-Regular.ttf
 
 # OS files
 .DS_Store
