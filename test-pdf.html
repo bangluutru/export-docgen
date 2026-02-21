@@ -3,20 +3,19 @@
 
 <head>
     <meta charset="UTF-8">
-    <title>PDF Renderer Test</title>
+    <title>PDF Renderer Test v2</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <script src="xlsx-reader.js"></script>
-    <script src="font-loader.js"></script>
     <script src="template-engine.js"></script>
     <script src="svg-pdf-renderer.js"></script>
     <style>
         body {
             font-family: monospace;
-            max-width: 900px;
-            margin: 40px auto;
+            max-width: 1100px;
+            margin: 20px auto;
             background: #1a1a2e;
             color: #e0e0e0;
         }
@@ -35,8 +34,8 @@
 
         pre {
             background: #16213e;
-            padding: 12px;
-            border-radius: 8px;
+            padding: 10px;
+            border-radius: 6px;
             overflow-x: auto;
         }
 
@@ -49,14 +48,14 @@
         }
 
         button {
-            padding: 12px 24px;
-            font-size: 16px;
+            padding: 10px 20px;
+            font-size: 14px;
             cursor: pointer;
             background: #e94560;
             color: white;
             border: none;
             border-radius: 8px;
-            margin: 8px;
+            margin: 6px;
         }
 
         button:hover {
@@ -66,61 +65,40 @@
 </head>
 
 <body>
-    <h1>🧪 SVG-PDF Renderer Test</h1>
-    <button onclick="runPDFTest()">▶ Test PDF (with template)</button>
-    <button onclick="runPDFTestNoTemplate()">▶ Test PDF (no template)</button>
+    <h1>🧪 HTML-PDF Renderer Test v2</h1>
+    <button onclick="runTest()">▶ Test PDF (template-based)</button>
+    <button onclick="runTestNoTpl()">▶ Test PDF (no template)</button>
     <pre id="log"></pre>
     <script>
         const log = document.getElementById('log');
-        function print(msg, cls = '') { log.innerHTML += `<span class="${cls}">${msg}</span>\n`; }
+        function p(msg, cls = '') { log.innerHTML += `<span class="${cls}">${msg}</span>\n`; }
 
-        async function runPDFTest() {
+        async function runTest() {
             log.innerHTML = '';
-            print('=== PDF Renderer Test (with template) ===', 'info');
+            p('=== HTML-PDF Renderer Test (with template) ===', 'info');
 
             try {
-                // 1. Load template
-                print('\n[1] Loading template...', 'info');
+                p('\n[1] Loading template...', 'info');
                 const tplResp = await fetch('template_mau.xlsx');
                 const tplBuffer = await tplResp.arrayBuffer();
                 const templateData = await TemplateEngine.analyzeTemplate(tplBuffer);
-                const summary = TemplateEngine.getTemplateSummary(templateData);
-                print(`   Headers: ${summary.columnHeaders.join(', ')}`);
-                print(`   ✓ Template loaded`, 'pass');
+                p(`   Sheets: ${templateData.sheetNames.join(', ')}`);
+                p(`   sheetPaths: ${templateData.sheetPaths?.join(', ') || 'MISSING!'}`);
+                p(`   zip: ${templateData.zip ? 'OK' : 'MISSING!'}`);
+                p(`   ✓ Template loaded`, 'pass');
 
-                // 2. Check style extraction
-                print('\n[2] Style info from template...', 'info');
-                const styles = templateData.stylesData;
-                if (styles) {
-                    print(`   Fonts: ${styles.fonts.length}, Fills: ${styles.fills.length}`);
-                    print(`   CellXFs: ${styles.cellXfs.length}`);
-
-                    // Check header style
-                    const hRow = templateData.analysis.columnHeaderRow.row;
-                    const hStyleIdx = parseInt(hRow.cells[0]?.s || '0');
-                    const hXf = styles.cellXfs[hStyleIdx] || {};
-                    const hFont = styles.fonts[hXf.fontId] || {};
-                    const hFill = styles.fills[hXf.fillId] || {};
-                    print(`   Header cell style index: ${hStyleIdx}`);
-                    print(`   Header font: ${hFont.name || '?'} ${hFont.size || '?'}pt, bold=${hFont.bold}`);
-                    print(`   Header fill: pattern=${hFill.pattern}, fgColor=${hFill.fgColorRgb || hFill.fgColorTheme || 'none'}`);
-                    print(`   ✓ Styles extracted`, 'pass');
-                }
-
-                // 3. Load test data
-                print('\n[3] Loading data...', 'info');
+                p('\n[2] Loading data...', 'info');
                 const dataResp = await fetch('test_data.xlsx');
                 const dataBuffer = await dataResp.arrayBuffer();
                 const workbook = await XLSXReader.read(dataBuffer);
                 const sheet = workbook.sheets[workbook.sheetNames[0]];
-                print(`   Rows: ${sheet.rows.length}`);
-                print(`   ✓ Data loaded`, 'pass');
+                p(`   Rows: ${sheet.rows.length}, Headers: ${sheet.headers.join(', ')}`);
+                p(`   ✓ Data loaded`, 'pass');
 
-                // 4. Generate PDF with template
-                print('\n[4] Generating PDF with template styles...', 'info');
+                p('\n[3] Generating PDF from template...', 'info');
                 const t0 = performance.now();
                 const blob = await SVGPDFRenderer.renderToPDF({
-                    headers: summary.columnHeaders.filter(h => h.trim().length > 0),
+                    headers: sheet.headers,
                     rows: sheet.rows,
                     templateData: templateData,
                     title: '',
@@ -130,57 +108,27 @@
                 const t1 = performance.now();
 
                 const sizeKB = (blob.size / 1024).toFixed(1);
-                print(`   Output size: ${sizeKB} KB`, 'pass');
-                print(`   Time: ${(t1 - t0).toFixed(0)} ms`);
-                print(`   ✓ PDF generated successfully`, 'pass');
+                p(`   Output size: ${sizeKB} KB`, sizeKB < 500 ? 'pass' : 'fail');
+                p(`   Time: ${(t1 - t0).toFixed(0)} ms`);
 
-                // 5. Compare with old method
-                print('\n[5] Comparing with old jsPDF autoTable method...', 'info');
-                const jsPDFLib = window.jspdf || window.jsPDF;
-                const oldDoc = new jsPDFLib.jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
-                if (typeof FontLoader !== 'undefined') {
-                    await FontLoader.registerFont(oldDoc);
-                }
-                const fontName = FontLoader.isLoaded() ? 'NotoSans' : 'helvetica';
-                oldDoc.autoTable({
-                    head: [sheet.headers],
-                    body: sheet.rows,
-                    startY: 15,
-                    styles: { font: fontName, fontSize: 9, cellPadding: 3 },
-                    headStyles: { fillColor: [99, 102, 241], textColor: 255, fontStyle: 'bold' },
-                });
-                const oldBlob = oldDoc.output('blob');
-                const oldSizeKB = (oldBlob.size / 1024).toFixed(1);
-
-                print(`   Old method: ${oldSizeKB} KB`);
-                print(`   New method: ${sizeKB} KB`);
-                const reduction = ((1 - blob.size / oldBlob.size) * 100).toFixed(0);
-                print(`   Size reduction: ${reduction}%`, reduction > 0 ? 'pass' : 'fail');
-
-                // Download
-                saveAs(blob, 'test_pdf_template.pdf');
-                print('\n📥 Downloaded test_pdf_template.pdf', 'info');
-
-                print('\n=== TEST COMPLETE ===', 'pass');
-
+                saveAs(blob, 'test_html_pdf_v2.pdf');
+                p('\n📥 Downloaded test_html_pdf_v2.pdf', 'pass');
+                p('=== COMPLETE ===', 'pass');
             } catch (err) {
-                print(`\n✗ ERROR: ${err.message}`, 'fail');
-                print(err.stack, 'fail');
+                p(`\n✗ ERROR: ${err.message}`, 'fail');
+                p(err.stack, 'fail');
             }
         }
 
-        async function runPDFTestNoTemplate() {
+        async function runTestNoTpl() {
             log.innerHTML = '';
-            print('=== PDF Renderer Test (no template) ===', 'info');
+            p('=== HTML-PDF Test (no template) ===', 'info');
 
             try {
                 const dataResp = await fetch('test_data.xlsx');
                 const dataBuffer = await dataResp.arrayBuffer();
                 const workbook = await XLSXReader.read(dataBuffer);
                 const sheet = workbook.sheets[workbook.sheetNames[0]];
-
-                print(`   Headers: ${sheet.headers.join(', ')}`);
-                print(`   Rows: ${sheet.rows.length}`);
 
                 const t0 = performance.now();
                 const blob = await SVGPDFRenderer.renderToPDF({
@@ -192,17 +140,12 @@
                 });
                 const t1 = performance.now();
 
-                const sizeKB = (blob.size / 1024).toFixed(1);
-                print(`   Output size: ${sizeKB} KB`, 'pass');
-                print(`   Time: ${(t1 - t0).toFixed(0)} ms`);
-
-                saveAs(blob, 'test_pdf_notpl.pdf');
-                print('\n📥 Downloaded test_pdf_notpl.pdf', 'info');
-                print('=== TEST COMPLETE ===', 'pass');
-
+                p(`   Size: ${(blob.size / 1024).toFixed(1)} KB, Time: ${(t1 - t0).toFixed(0)} ms`);
+                saveAs(blob, 'test_html_pdf_notpl.pdf');
+                p('📥 Downloaded', 'pass');
             } catch (err) {
-                print(`\n✗ ERROR: ${err.message}`, 'fail');
-                print(err.stack, 'fail');
+                p(`✗ ERROR: ${err.message}`, 'fail');
+                p(err.stack, 'fail');
             }
         }
     </script>

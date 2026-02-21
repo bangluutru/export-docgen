@@ -101,6 +101,7 @@ const TemplateEngine = (() => {
             sharedStrings: sharedStrings,
             rawSiElements: rawSiElements,
             firstSheetPath: firstSheetPath,
+            sheetPaths: sheets.map(s => relMap[s.rId]).filter(Boolean),
             analysis: analysis,
             sheetNames: sheets.map(s => s.name),
             stylesData: stylesData,

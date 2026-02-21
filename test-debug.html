@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Template Structure Debug</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="template-engine.js"></script>
+    <style>
+        body {
+            font-family: monospace;
+            max-width: 1200px;
+            margin: 20px auto;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-size: 12px;
+        }
+
+        pre {
+            background: #16213e;
+            padding: 10px;
+            border-radius: 6px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+        }
+
+        h2 {
+            color: #e94560;
+        }
+
+        table {
+            border-collapse: collapse;
+            margin: 10px 0;
+        }
+
+        td,
+        th {
+            border: 1px solid #444;
+            padding: 3px 6px;
+            font-size: 11px;
+        }
+
+        th {
+            background: #2a2a4a;
+        }
+
+        .merge {
+            color: #ffc107;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Template Structure Debug</h2>
+    <pre id="log"></pre>
+    <script>
+        const log = document.getElementById('log');
+        function p(msg) { log.textContent += msg + '\n'; }
+
+        (async () => {
+            const resp = await fetch('template_mau.xlsx');
+            const buf = await resp.arrayBuffer();
+            const zip = await JSZip.loadAsync(buf);
+
+            // Parse shared strings
+            const ssFile = zip.file('xl/sharedStrings.xml');
+            const ssXml = await ssFile.async('string');
+            const ssDoc = new DOMParser().parseFromString(ssXml, 'application/xml');
+            const siNodes = ssDoc.getElementsByTagName('si');
+            const strings = [];
+            for (let i = 0; i < siNodes.length; i++) {
+                const tNodes = siNodes[i].getElementsByTagName('t');
+                let text = '';
+                for (let j = 0; j < tNodes.length; j++) text += tNodes[j].textContent || '';
+                strings.push(text);
+            }
+
+            // Parse first sheet
+            const sheetXml = await zip.file('xl/worksheets/sheet1.xml').async('string');
+            const sheetDoc = new DOMParser().parseFromString(sheetXml, 'application/xml');
+
+            // Show ALL rows with ALL cells
+            const rowNodes = sheetDoc.getElementsByTagName('row');
+            p(`=== SHEET1: ${rowNodes.length} rows ===\n`);
+
+            for (let i = 0; i < Math.min(rowNodes.length, 60); i++) {
+                const row = rowNodes[i];
+                const rn = row.getAttribute('r');
+                const ht = row.getAttribute('ht') || '-';
+                const cells = row.getElementsByTagName('c');
+
+                let cellInfo = [];
+                for (let j = 0; j < cells.length; j++) {
+                    const c = cells[j];
+                    const ref = c.getAttribute('r');
+                    const s = c.getAttribute('s') || '0';
+                    const t = c.getAttribute('t') || '';
+                    const vEl = c.getElementsByTagName('v')[0];
+                    const fEl = c.getElementsByTagName('f')[0];
+                    let val = vEl ? vEl.textContent : '';
+                    let display = val;
+                    if (t === 's' && strings[parseInt(val)]) display = strings[parseInt(val)];
+
+                    let info = `${ref}[s${s}]`;
+                    if (t === 's') info += `="${display}"`;
+                    else if (val) info += `=${val}`;
+                    if (fEl) info += ` f=${fEl.textContent}`;
+                    cellInfo.push(info);
+                }
+                p(`Row ${rn.padStart(3)} (ht=${ht}): ${cellInfo.join(' | ')}`);
+            }
+
+            // Show merge cells
+            p('\n=== MERGE CELLS ===');
+            const mergeNodes = sheetDoc.getElementsByTagName('mergeCell');
+            for (let i = 0; i < mergeNodes.length; i++) {
+                p(`  ${mergeNodes[i].getAttribute('ref')}`);
+            }
+
+            // Show columns
+            p('\n=== COLUMNS ===');
+            const colNodes = sheetDoc.getElementsByTagName('col');
+            for (let i = 0; i < colNodes.length; i++) {
+                const c = colNodes[i];
+                p(`  col ${c.getAttribute('min')}-${c.getAttribute('max')}: width=${c.getAttribute('width')} customWidth=${c.getAttribute('customWidth')}`);
+            }
+
+            // Parse styles briefly
+            const stylesXml = await zip.file('xl/styles.xml').async('string');
+            const stylesDoc = new DOMParser().parseFromString(stylesXml, 'application/xml');
+
+            // Show key style indices used in header/data zone
+            p('\n=== KEY STYLES ===');
+            const xfNodes = stylesDoc.getElementsByTagName('cellXfs')[0]?.querySelectorAll(':scope > xf');
+            const fonts = stylesDoc.getElementsByTagName('fonts')[0]?.querySelectorAll(':scope > font');
+            const fills = stylesDoc.getElementsByTagName('fills')[0]?.querySelectorAll(':scope > fill');
+
+            // Show styles for indices seen in rows 1-20
+            const usedStyles = new Set();
+            for (let i = 0; i < Math.min(rowNodes.length, 60); i++) {
+                const cells = rowNodes[i].getElementsByTagName('c');
+                for (let j = 0; j < cells.length; j++) {
+                    usedStyles.add(parseInt(cells[j].getAttribute('s') || '0'));
+                }
+            }
+
+            const serializer = new XMLSerializer();
+            for (const sIdx of [...usedStyles].sort((a, b) => a - b).slice(0, 30)) {
+                if (xfNodes && xfNodes[sIdx]) {
+                    const xf = xfNodes[sIdx];
+                    const fontId = parseInt(xf.getAttribute('fontId') || '0');
+                    const fillId = parseInt(xf.getAttribute('fillId') || '0');
+                    const borderId = parseInt(xf.getAttribute('borderId') || '0');
+                    const numFmtId = xf.getAttribute('numFmtId') || '0';
+
+                    let fontDesc = '';
+                    if (fonts && fonts[fontId]) {
+                        const f = fonts[fontId];
+                        const nameEl = f.getElementsByTagName('name')[0];
+                        const szEl = f.getElementsByTagName('sz')[0];
+                        const bEl = f.getElementsByTagName('b');
+                        fontDesc = `${nameEl?.getAttribute('val') || '?'} ${szEl?.getAttribute('val') || '?'}pt${bEl.length ? ' BOLD' : ''}`;
+                    }
+
+                    let fillDesc = '';
+                    if (fills && fills[fillId]) {
+                        const pf = fills[fillId].getElementsByTagName('patternFill')[0];
+                        if (pf) {
+                            const fg = pf.getElementsByTagName('fgColor')[0];
+                            fillDesc = `${pf.getAttribute('patternType')} fg=${fg?.getAttribute('rgb') || fg?.getAttribute('theme') || 'none'}`;
+                        }
+                    }
+
+                    const al = xf.getElementsByTagName('alignment')[0];
+                    const alDesc = al ? `h=${al.getAttribute('horizontal') || '-'} v=${al.getAttribute('vertical') || '-'}` : '';
+
+                    p(`  s${sIdx}: font[${fontId}]=${fontDesc} fill[${fillId}]=${fillDesc} border[${borderId}] nfmt=${numFmtId} ${alDesc}`);
+                }
+            }
+
+            p('\n=== DONE ===');
+        })();
+    </script>
+</body>
+
+</html>

@@ -1,26 +1,24 @@
 /**
- * SVG-PDF Renderer — Render Excel-like tables to SVG, then convert to tiny vector PDFs.
+ * HTML-PDF Renderer — Cell-perfect HTML table rendering from Excel template.
  * 
- * Architecture:
- * 1. Read styles from template's xl/styles.xml (fonts, fills, borders, alignment)
- * 2. Build a table layout with precise cell positions
- * 3. Render to SVG (vector — no raster images needed)
- * 4. Use jsPDF to convert SVG pages into a multi-page PDF
+ * BREAKTHROUGH APPROACH:
+ * Instead of trying to manually position elements with jsPDF drawing commands,
+ * we build a pixel-perfect HTML table from the Excel template's XML structure,
+ * then convert it to PDF using jsPDF.html() — leveraging the browser's own
+ * rendering engine for perfect layout.
  * 
- * Result: PDF files ~50-150KB instead of ~1.5MB
+ * Flow:
+ * 1. Parse template ZIP → extract sheet XML, styles XML, shared strings
+ * 2. Map every cell style to CSS (font, size, color, fill, border, alignment)
+ * 3. Build HTML table with exact merge cells (colspan/rowspan)
+ * 4. Replace data zone rows with new data (preserving style patterns)
+ * 5. Convert HTML → PDF via jsPDF.html() or window.print()
  */
 const SVGPDFRenderer = (() => {
     'use strict';
 
-    // Excel column width unit → mm (1 char width ≈ 2.3mm at 10pt)
-    const EXCEL_COL_WIDTH_TO_MM = 2.3;
-    // Excel row height unit (points) → mm (1pt = 0.3528mm)
-    const PT_TO_MM = 0.3528;
-    // Default sizes
-    const DEFAULT_FONT_SIZE = 10;
-    const DEFAULT_ROW_HEIGHT = 15; // points
-    const MIN_COL_WIDTH_MM = 8;
-    const CELL_PADDING_MM = 1.5;
+    const PT_TO_PX = 1.33; // 1pt = 1.33px
+    const EXCEL_COL_TO_PX = 7.5; // 1 Excel column width unit ≈ 7.5px
 
     // Page sizes in mm
     const PAGE_SIZES = {
@@ -29,32 +27,15 @@ const SVGPDFRenderer = (() => {
         letter: { w: 215.9, h: 279.4 },
     };
 
-    // OpenXML theme colors (simplified — Excel default theme)
+    // OpenXML theme colors (Excel default theme)
     const THEME_COLORS = [
-        'FFFFFF', // 0: light1 (window background)
-        '000000', // 1: dark1 (window text)
-        'E7E6E6', // 2: light2
-        '44546A', // 3: dark2
-        '4472C4', // 4: accent1
-        'ED7D31', // 5: accent2
-        'A5A5A5', // 6: accent3
-        'FFC000', // 7: accent4
-        '5B9BD5', // 8: accent5
-        '70AD47', // 9: accent6
+        'FFFFFF', '000000', 'E7E6E6', '44546A',
+        '4472C4', 'ED7D31', 'A5A5A5', 'FFC000',
+        '5B9BD5', '70AD47',
     ];
 
     /**
-     * Render data to PDF using SVG intermediate.
-     * 
-     * @param {Object} opts
-     * @param {string[]} opts.headers - Column headers
-     * @param {Array<Array>} opts.rows - Data rows
-     * @param {Object} opts.templateData - Template data from TemplateEngine.analyzeTemplate (optional)
-     * @param {string} opts.title - Report title
-     * @param {string} opts.pageSize - 'a4', 'a3', 'letter'
-     * @param {boolean} opts.landscape - Landscape orientation
-     * @param {Object} opts.margins - Page margins { top, right, bottom, left } in mm
-     * @returns {Promise<Blob>} PDF blob
+     * Main entry — render data to PDF using HTML intermediate
      */
     async function renderToPDF(opts) {
         const {
@@ -64,515 +45,601 @@ const SVGPDFRenderer = (() => {
             title = '',
             pageSize = 'a4',
             landscape = false,
-            margins = { top: 10, right: 8, bottom: 10, left: 8 },
+            margins = { top: 8, right: 6, bottom: 8, left: 6 },
         } = opts;
 
-        // Page dimensions
+        // If we have template data, use the cell-perfect approach
+        if (templateData && templateData.zip) {
+            return await renderFromTemplate(templateData, rows, pageSize, landscape, margins);
+        }
+
+        // Fallback: generate a clean styled HTML table for non-template data
+        return await renderSimpleTable(headers, rows, title, pageSize, landscape, margins);
+    }
+
+    /**
+     * Cell-perfect rendering from template
+     */
+    async function renderFromTemplate(templateData, dataRows, pageSize, landscape, margins) {
+        const zip = templateData.zip;
+        const analysis = templateData.analysis;
+
+        // 1. Parse raw XML from the template
+        const sheetXml = await zip.file(templateData.sheetPaths[0]).async('string');
+        const sheetDoc = new DOMParser().parseFromString(sheetXml, 'application/xml');
+
+        const ssFile = zip.file('xl/sharedStrings.xml');
+        const ssXml = ssFile ? await ssFile.async('string') : '<sst/>';
+        const ssDoc = new DOMParser().parseFromString(ssXml, 'application/xml');
+        const strings = parseSharedStringsArray(ssDoc);
+
+        const stylesXml = await zip.file('xl/styles.xml').async('string');
+        const stylesDoc = new DOMParser().parseFromString(stylesXml, 'application/xml');
+        const styleMap = buildStyleMap(stylesDoc);
+
+        // 2. Parse column widths
+        const colNodes = sheetDoc.getElementsByTagName('col');
+        const colWidths = {};
+        for (let i = 0; i < colNodes.length; i++) {
+            const min = parseInt(colNodes[i].getAttribute('min'));
+            const max = parseInt(colNodes[i].getAttribute('max'));
+            const w = parseFloat(colNodes[i].getAttribute('width'));
+            for (let c = min; c <= max; c++) {
+                colWidths[c] = w;
+            }
+        }
+
+        // 3. Parse merge cells
+        const mergeNodes = sheetDoc.getElementsByTagName('mergeCell');
+        const merges = [];
+        for (let i = 0; i < mergeNodes.length; i++) {
+            const ref = mergeNodes[i].getAttribute('ref');
+            merges.push(parseMergeRef(ref));
+        }
+
+        // 4. Parse all rows
+        const rowNodes = sheetDoc.getElementsByTagName('row');
+        const allRows = [];
+        for (let i = 0; i < rowNodes.length; i++) {
+            const row = rowNodes[i];
+            const rn = parseInt(row.getAttribute('r'));
+            const ht = parseFloat(row.getAttribute('ht')) || 16;
+            const cells = [];
+            const cellNodes = row.getElementsByTagName('c');
+            for (let j = 0; j < cellNodes.length; j++) {
+                const c = cellNodes[j];
+                const ref = c.getAttribute('r');
+                const { col, colNum } = parseCellRef(ref);
+                const s = parseInt(c.getAttribute('s') || '0');
+                const t = c.getAttribute('t') || '';
+                const vEl = c.getElementsByTagName('v')[0];
+                const fEl = c.getElementsByTagName('f')[0];
+                let val = vEl ? vEl.textContent : '';
+                let display = val;
+                if (t === 's') display = strings[parseInt(val)] || '';
+                cells.push({ ref, col, colNum, s, t, val, display, hasFormula: !!fEl });
+            }
+            allRows.push({ rowNum: rn, ht, cells });
+        }
+
+        // 5. Determine zones
+        const dataStart = analysis.dataZone.startRowNum;
+        const dataEnd = analysis.dataZone.endRowNum;
+        const headerRows = allRows.filter(r => r.rowNum < dataStart);
+        const templateDataRows = allRows.filter(r => r.rowNum >= dataStart && r.rowNum <= dataEnd);
+        const footerRows = allRows.filter(r => r.rowNum > dataEnd);
+
+        // 6. Get style patterns from template data rows
+        const stylePatterns = [];
+        for (const tr of templateDataRows) {
+            stylePatterns.push(tr.cells.map(c => c.s));
+        }
+
+        // 7. Get max columns
+        const maxCol = Math.max(8, ...allRows.flatMap(r => r.cells.map(c => c.colNum)));
+
+        // 8. Build new data rows with template styles
+        const newDataRows = buildNewDataRows(dataRows, dataStart, stylePatterns, templateDataRows, maxCol, analysis);
+
+        // 9. Compute row shift for footer
+        const originalDataCount = dataEnd - dataStart + 1;
+        const newDataCount = newDataRows.length;
+        const shift = newDataCount - originalDataCount;
+
+        // 10. Adjust footer row numbers
+        const adjustedFooterRows = footerRows.map(r => ({
+            ...r,
+            rowNum: r.rowNum + shift,
+        }));
+
+        // 11. Adjust merges
+        const adjustedMerges = adjustMerges(merges, dataStart, dataEnd, shift, newDataCount);
+
+        // 12. Build HTML table
+        const allFinalRows = [...headerRows, ...newDataRows, ...adjustedFooterRows];
+        const html = buildHTMLTable(allFinalRows, colWidths, adjustedMerges, styleMap, maxCol, pageSize, landscape, margins);
+
+        // 13. Convert to PDF
+        return await htmlToPDF(html, pageSize, landscape, margins);
+    }
+
+    /**
+     * Simple table rendering (no template)
+     */
+    async function renderSimpleTable(headers, rows, title, pageSize, landscape, margins) {
         const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
         const pw = landscape ? pgBase.h : pgBase.w;
-        const ph = landscape ? pgBase.w : pgBase.h;
-        const contentW = pw - margins.left - margins.right;
-        const contentH = ph - margins.top - margins.bottom;
 
-        // Build style info from template
-        const styleInfo = templateData ? extractStyleInfo(templateData) : getDefaultStyleInfo();
+        let html = `<div style="font-family: 'Times New Roman', serif; width: ${pw - margins.left - margins.right}mm; margin: 0 auto;">`;
+        if (title) {
+            html += `<h1 style="text-align: center; font-size: 18pt; margin: 10px 0 15px;">${escapeHtml(title)}</h1>`;
+        }
+        html += `<table style="width: 100%; border-collapse: collapse; font-size: 10pt;">`;
+        html += `<thead><tr>`;
+        for (const h of headers) {
+            html += `<th style="border: 1px solid #333; padding: 4px 6px; background: #4472C4; color: white; font-weight: bold; text-align: center;">${escapeHtml(String(h))}</th>`;
+        }
+        html += `</tr></thead><tbody>`;
+        for (let ri = 0; ri < rows.length; ri++) {
+            const bg = ri % 2 === 1 ? ' background: #f2f2f2;' : '';
+            html += `<tr>`;
+            for (let ci = 0; ci < headers.length; ci++) {
+                const val = String(rows[ri]?.[ci] || '');
+                const align = isNumericStr(val) ? 'right' : (ci === 0 ? 'center' : 'left');
+                html += `<td style="border: 1px solid #999; padding: 3px 5px; text-align: ${align};${bg}">${escapeHtml(val)}</td>`;
+            }
+            html += `</tr>`;
+        }
+        html += `</tbody></table></div>`;
 
-        // Calculate column widths
-        const colWidths = calculateColumnWidths(headers, rows, contentW, templateData);
+        return await htmlToPDF(html, pageSize, landscape, margins);
+    }
 
-        // Calculate row heights
-        const headerRowHeight = styleInfo.headerRowHeight || 8;
-        const dataRowHeight = styleInfo.dataRowHeight || 6;
+    // ===== HELPER FUNCTIONS =====
 
-        // Build header zone info (company info, title from template)
-        const headerZoneInfo = templateData ? extractHeaderZoneInfo(templateData) : null;
-        const headerZoneHeight = headerZoneInfo ? headerZoneInfo.totalHeight : (title ? 12 : 0);
+    function parseSharedStringsArray(ssDoc) {
+        const siNodes = ssDoc.getElementsByTagName('si');
+        const arr = [];
+        for (let i = 0; i < siNodes.length; i++) {
+            const tNodes = siNodes[i].getElementsByTagName('t');
+            let text = '';
+            for (let j = 0; j < tNodes.length; j++) text += tNodes[j].textContent || '';
+            arr.push(text);
+        }
+        return arr;
+    }
 
-        // Split rows into pages
-        const pages = paginateRows(rows, contentH, headerRowHeight, dataRowHeight, headerZoneHeight);
+    function parseCellRef(ref) {
+        const match = ref.match(/^([A-Z]+)(\d+)$/);
+        if (!match) return { col: 'A', colNum: 1, rowNum: 1 };
+        const col = match[1];
+        const rowNum = parseInt(match[2]);
+        let colNum = 0;
+        for (let i = 0; i < col.length; i++) {
+            colNum = colNum * 26 + (col.charCodeAt(i) - 64);
+        }
+        return { col, colNum, rowNum };
+    }
 
-        // Create jsPDF document with compression
+    function colNumToLetter(num) {
+        let s = '';
+        while (num > 0) {
+            num--;
+            s = String.fromCharCode(65 + (num % 26)) + s;
+            num = Math.floor(num / 26);
+        }
+        return s;
+    }
+
+    function parseMergeRef(ref) {
+        const [start, end] = ref.split(':');
+        const s = parseCellRef(start);
+        const e = parseCellRef(end);
+        return {
+            ref,
+            startCol: s.colNum,
+            endCol: e.colNum,
+            startRow: s.rowNum,
+            endRow: e.rowNum,
+            colspan: e.colNum - s.colNum + 1,
+            rowspan: e.rowNum - s.rowNum + 1,
+        };
+    }
+
+    function buildStyleMap(stylesDoc) {
+        // Parse fonts
+        const fontNodes = stylesDoc.getElementsByTagName('fonts')[0]?.querySelectorAll(':scope > font') || [];
+        const fonts = [];
+        for (const f of fontNodes) {
+            const nameEl = f.getElementsByTagName('name')[0];
+            const szEl = f.getElementsByTagName('sz')[0];
+            const bNodes = f.getElementsByTagName('b');
+            const iNodes = f.getElementsByTagName('i');
+            const colorEl = f.getElementsByTagName('color')[0];
+            fonts.push({
+                name: nameEl?.getAttribute('val') || 'serif',
+                size: parseFloat(szEl?.getAttribute('val') || '11'),
+                bold: bNodes.length > 0,
+                italic: iNodes.length > 0,
+                colorRgb: colorEl?.getAttribute('rgb') || null,
+                colorTheme: colorEl?.getAttribute('theme') || null,
+            });
+        }
+
+        // Parse fills
+        const fillNodes = stylesDoc.getElementsByTagName('fills')[0]?.querySelectorAll(':scope > fill') || [];
+        const fills = [];
+        for (const f of fillNodes) {
+            const pf = f.getElementsByTagName('patternFill')[0];
+            if (!pf) { fills.push(null); continue; }
+            const fg = pf.getElementsByTagName('fgColor')[0];
+            const bg = pf.getElementsByTagName('bgColor')[0];
+            fills.push({
+                pattern: pf.getAttribute('patternType') || 'none',
+                fgRgb: fg?.getAttribute('rgb') || null,
+                fgTheme: fg?.getAttribute('theme') || null,
+                bgRgb: bg?.getAttribute('rgb') || null,
+            });
+        }
+
+        // Parse borders
+        const borderNodes = stylesDoc.getElementsByTagName('borders')[0]?.querySelectorAll(':scope > border') || [];
+        const borders = [];
+        for (const b of borderNodes) {
+            const sides = {};
+            for (const side of ['left', 'right', 'top', 'bottom']) {
+                const el = b.getElementsByTagName(side)[0];
+                if (el && el.getAttribute('style')) {
+                    const colorEl = el.getElementsByTagName('color')[0];
+                    sides[side] = {
+                        style: el.getAttribute('style'),
+                        color: colorEl?.getAttribute('rgb') || colorEl?.getAttribute('auto') === 'true' ? '000000' : null,
+                    };
+                }
+            }
+            borders.push(sides);
+        }
+
+        // Parse cellXfs
+        const xfNodes = stylesDoc.getElementsByTagName('cellXfs')[0]?.querySelectorAll(':scope > xf') || [];
+        const xfs = [];
+        for (const xf of xfNodes) {
+            const al = xf.getElementsByTagName('alignment')[0];
+            xfs.push({
+                fontId: parseInt(xf.getAttribute('fontId') || '0'),
+                fillId: parseInt(xf.getAttribute('fillId') || '0'),
+                borderId: parseInt(xf.getAttribute('borderId') || '0'),
+                numFmtId: parseInt(xf.getAttribute('numFmtId') || '0'),
+                alignment: al ? {
+                    horizontal: al.getAttribute('horizontal') || null,
+                    vertical: al.getAttribute('vertical') || null,
+                    wrapText: al.getAttribute('wrapText') === '1',
+                } : null,
+            });
+        }
+
+        // Parse number formats
+        const nfNodes = stylesDoc.getElementsByTagName('numFmt');
+        const numFmts = {};
+        for (let i = 0; i < nfNodes.length; i++) {
+            numFmts[parseInt(nfNodes[i].getAttribute('numFmtId'))] = nfNodes[i].getAttribute('formatCode');
+        }
+
+        return { fonts, fills, borders, xfs, numFmts };
+    }
+
+    function styleToCss(styleIdx, styleMap) {
+        const xf = styleMap.xfs[styleIdx];
+        if (!xf) return '';
+
+        const parts = [];
+
+        // Font
+        const font = styleMap.fonts[xf.fontId];
+        if (font) {
+            const fontFamily = font.name.includes('Gothic') || font.name.includes('Sans')
+                ? `'${font.name}', 'Noto Sans', sans-serif`
+                : `'${font.name}', 'Times New Roman', serif`;
+            parts.push(`font-family: ${fontFamily}`);
+            parts.push(`font-size: ${Math.min(font.size, 14)}pt`);
+            if (font.bold) parts.push('font-weight: bold');
+            if (font.italic) parts.push('font-style: italic');
+            const color = resolveColor(font.colorRgb, font.colorTheme);
+            if (color && color !== '000000') parts.push(`color: #${color}`);
+        }
+
+        // Fill
+        const fill = styleMap.fills[xf.fillId];
+        if (fill && fill.pattern !== 'none' && fill.pattern !== 'gray125') {
+            const bgColor = resolveColor(fill.fgRgb, fill.fgTheme);
+            if (bgColor) parts.push(`background-color: #${bgColor}`);
+        }
+
+        // Border
+        const border = styleMap.borders[xf.borderId];
+        if (border) {
+            for (const side of ['left', 'right', 'top', 'bottom']) {
+                if (border[side]) {
+                    const bStyle = mapBorderStyle(border[side].style);
+                    const bColor = border[side].color || '000000';
+                    parts.push(`border-${side}: ${bStyle} #${bColor.replace(/^FF/, '')}`);
+                }
+            }
+        }
+
+        // Alignment
+        if (xf.alignment) {
+            if (xf.alignment.horizontal) parts.push(`text-align: ${xf.alignment.horizontal}`);
+            if (xf.alignment.vertical) {
+                const vMap = { top: 'top', center: 'middle', bottom: 'bottom' };
+                parts.push(`vertical-align: ${vMap[xf.alignment.vertical] || 'middle'}`);
+            }
+            if (xf.alignment.wrapText) parts.push('word-wrap: break-word');
+        }
+
+        return parts.join('; ');
+    }
+
+    function resolveColor(rgb, theme) {
+        if (rgb && rgb.length >= 6) {
+            return rgb.length === 8 ? rgb.substring(2) : rgb;
+        }
+        if (theme !== null && theme !== undefined) {
+            const t = parseInt(theme);
+            if (t >= 0 && t < THEME_COLORS.length) return THEME_COLORS[t];
+        }
+        return null;
+    }
+
+    function mapBorderStyle(xlStyle) {
+        const map = {
+            thin: '1px solid', medium: '2px solid', thick: '3px solid',
+            dashed: '1px dashed', dotted: '1px dotted',
+            hair: '0.5px solid', double: '3px double',
+        };
+        return map[xlStyle] || '1px solid';
+    }
+
+    function formatNumber(val, numFmtId, numFmts) {
+        if (!val || val === '') return '';
+        const num = parseFloat(val);
+        if (isNaN(num)) return val;
+
+        // Built-in format IDs
+        if (numFmtId === 38 || numFmtId === 39 || numFmtId === 40) {
+            // Japanese number format: #,##0 / #,##0.00
+            return num.toLocaleString('ja-JP');
+        }
+        if (numFmtId === 3 || numFmtId === 4) {
+            return num.toLocaleString();
+        }
+
+        // Custom format
+        const fmt = numFmts[numFmtId];
+        if (fmt && fmt.includes('#,##0')) {
+            const decimals = (fmt.match(/\.0+/) || [''])[0].length - 1;
+            return num.toLocaleString('ja-JP', {
+                minimumFractionDigits: Math.max(0, decimals),
+                maximumFractionDigits: Math.max(0, decimals),
+            });
+        }
+
+        // Date format (for numFmtId 14-22 or custom date formats)
+        if ((numFmtId >= 14 && numFmtId <= 22) || (fmt && (fmt.includes('yy') || fmt.includes('mm') || fmt.includes('dd')))) {
+            const date = excelDateToJS(num);
+            if (date) {
+                return date.toLocaleDateString('ja-JP', { year: 'numeric', month: '2-digit', day: '2-digit' });
+            }
+        }
+
+        // numFmtId 49 = text format
+        if (numFmtId === 49) return val;
+
+        return val;
+    }
+
+    function excelDateToJS(serial) {
+        if (serial < 1) return null;
+        const epoch = new Date(1899, 11, 30);
+        return new Date(epoch.getTime() + serial * 86400000);
+    }
+
+    function buildNewDataRows(dataRows, dataStart, stylePatterns, templateDataRows, maxCol, analysis) {
+        const newRows = [];
+
+        for (let ri = 0; ri < dataRows.length; ri++) {
+            const rowData = dataRows[ri];
+            const rowNum = dataStart + ri;
+
+            // Cycle through style patterns
+            const patternIdx = ri % Math.max(1, stylePatterns.length);
+            const patternStyles = stylePatterns[patternIdx] || [];
+
+            // Use template data row structure as a guide
+            const templateRow = templateDataRows[patternIdx] || templateDataRows[0];
+            const ht = templateRow?.ht || 18;
+
+            const cells = [];
+            for (let ci = 0; ci < Math.min(rowData.length, maxCol); ci++) {
+                const colNum = ci + 1;
+                const ref = colNumToLetter(colNum) + rowNum;
+                const style = patternStyles[ci] !== undefined ? patternStyles[ci] : 0;
+                cells.push({
+                    ref,
+                    col: colNumToLetter(colNum),
+                    colNum,
+                    s: style,
+                    display: String(rowData[ci] || ''),
+                    val: String(rowData[ci] || ''),
+                });
+            }
+
+            newRows.push({ rowNum, ht, cells });
+        }
+
+        return newRows;
+    }
+
+    function adjustMerges(merges, dataStart, dataEnd, shift, newDataCount) {
+        const result = [];
+        const newDataEnd = dataStart + newDataCount - 1;
+
+        for (const m of merges) {
+            if (m.startRow >= dataStart && m.endRow <= dataEnd) {
+                // Data zone merge — skip (data rows don't have merges by default)
+                continue;
+            } else if (m.startRow > dataEnd) {
+                // Footer merge — shift
+                result.push({
+                    ...m,
+                    startRow: m.startRow + shift,
+                    endRow: m.endRow + shift,
+                });
+            } else {
+                // Header merge — keep as-is
+                result.push(m);
+            }
+        }
+
+        return result;
+    }
+
+    function buildHTMLTable(allRows, colWidths, merges, styleMap, maxCol, pageSize, landscape, margins) {
+        const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
+        const totalWidthMm = (landscape ? pgBase.h : pgBase.w) - margins.left - margins.right;
+
+        // Calculate total Excel width to scale columns proportionally
+        let totalExcelWidth = 0;
+        for (let c = 1; c <= maxCol; c++) {
+            totalExcelWidth += (colWidths[c] || 8.43);
+        }
+
+        // Build merged cell lookup: key = "row,col" → { colspan, rowspan, isOrigin }
+        const mergeMap = {};
+        for (const m of merges) {
+            for (let r = m.startRow; r <= m.endRow; r++) {
+                for (let c = m.startCol; c <= m.endCol; c++) {
+                    if (r === m.startRow && c === m.startCol) {
+                        mergeMap[`${r},${c}`] = { colspan: m.colspan, rowspan: m.rowspan, isOrigin: true };
+                    } else {
+                        mergeMap[`${r},${c}`] = { isOrigin: false };
+                    }
+                }
+            }
+        }
+
+        let html = `<table style="border-collapse: collapse; width: ${totalWidthMm}mm; table-layout: fixed;">`;
+
+        // Column groups for widths
+        html += '<colgroup>';
+        for (let c = 1; c <= maxCol; c++) {
+            const w = colWidths[c] || 8.43;
+            const pct = (w / totalExcelWidth * 100).toFixed(2);
+            html += `<col style="width: ${pct}%;">`;
+        }
+        html += '</colgroup>';
+
+        // Render rows
+        for (const row of allRows) {
+            const htPx = Math.round(row.ht * PT_TO_PX);
+            html += `<tr style="height: ${htPx}px;">`;
+
+            // Build cell map for this row
+            const cellMap = {};
+            for (const cell of row.cells) {
+                cellMap[cell.colNum] = cell;
+            }
+
+            for (let c = 1; c <= maxCol; c++) {
+                const mergeKey = `${row.rowNum},${c}`;
+                const merge = mergeMap[mergeKey];
+
+                if (merge && !merge.isOrigin) {
+                    // Skip — covered by a merge
+                    continue;
+                }
+
+                const cell = cellMap[c];
+                const colspanAttr = merge && merge.colspan > 1 ? ` colspan="${merge.colspan}"` : '';
+                const rowspanAttr = merge && merge.rowspan > 1 ? ` rowspan="${merge.rowspan}"` : '';
+
+                let css = 'padding: 2px 4px; overflow: hidden; white-space: nowrap;';
+                let content = '';
+
+                if (cell) {
+                    css += styleToCss(cell.s, styleMap);
+
+                    // Format numbers
+                    const xf = styleMap.xfs[cell.s];
+                    const numFmtId = xf?.numFmtId || 0;
+                    if (cell.display && numFmtId > 0 && cell.t !== 's') {
+                        content = formatNumber(cell.display, numFmtId, styleMap.numFmts);
+                    } else {
+                        content = cell.display || '';
+                    }
+                }
+
+                html += `<td${colspanAttr}${rowspanAttr} style="${css}">${escapeHtml(content)}</td>`;
+            }
+
+            html += '</tr>';
+        }
+
+        html += '</table>';
+        return html;
+    }
+
+    async function htmlToPDF(html, pageSize, landscape, margins) {
         const jsPDFLib = window.jspdf || window.jsPDF;
+
         const doc = new jsPDFLib.jsPDF({
             orientation: landscape ? 'landscape' : 'portrait',
             unit: 'mm',
             format: pageSize,
-            compress: true, // Enable stream compression for smaller output
+            compress: true,
         });
 
-        // Smart font loading: only load Unicode font if data contains non-ASCII chars
-        const allText = [title, ...headers.map(String), ...rows.flat().map(String)].join('');
-        const needsUnicode = /[^\x00-\x7F]/.test(allText);
+        // Create a hidden container
+        const container = document.createElement('div');
+        container.style.cssText = `
+            position: absolute; left: -9999px; top: 0;
+            font-family: 'Times New Roman', serif;
+        `;
+        container.innerHTML = html;
+        document.body.appendChild(container);
 
-        let fontName = 'helvetica';
-        if (needsUnicode && typeof FontLoader !== 'undefined') {
-            await FontLoader.registerFont(doc);
-            if (FontLoader.isLoaded()) fontName = 'NotoSans';
-        }
+        try {
+            const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
+            const pw = landscape ? pgBase.h : pgBase.w;
+            const ph = landscape ? pgBase.w : pgBase.h;
 
-        // Render each page
-        for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
-            if (pageIdx > 0) doc.addPage();
-
-            const page = pages[pageIdx];
-            let yOffset = margins.top;
-
-            // Render header zone (company info, title) — only on first page or all pages
-            if (headerZoneInfo && pageIdx === 0) {
-                yOffset = renderHeaderZone(doc, headerZoneInfo, margins.left, yOffset, contentW, fontName);
-            } else if (title && pageIdx === 0) {
-                doc.setFontSize(14);
-                doc.setFont(fontName, 'bold');
-                doc.text(title, pw / 2, yOffset + 5, { align: 'center' });
-                yOffset += 10;
-            }
-
-            // Render column headers
-            yOffset = renderTableHeaders(doc, headers, colWidths, margins.left, yOffset, styleInfo, fontName);
-
-            // Render data rows
-            yOffset = renderTableRows(doc, page.rows, colWidths, margins.left, yOffset, styleInfo, fontName, page.startRowNum);
-
-            // Render footer zone (totals) — only on last page
-            if (pageIdx === pages.length - 1 && templateData) {
-                renderFooterZone(doc, templateData, margins.left, yOffset, colWidths, styleInfo, fontName);
-            }
-
-            // Page number
-            doc.setFontSize(8);
-            doc.setFont(fontName, 'normal');
-            doc.setTextColor(150, 150, 150);
-            doc.text(`${pageIdx + 1} / ${pages.length}`, pw / 2, ph - 5, { align: 'center' });
-            doc.setTextColor(0, 0, 0);
-        }
-
-        return doc.output('blob');
-    }
-
-    /**
-     * Extract style info from template data for PDF rendering
-     */
-    function extractStyleInfo(templateData) {
-        const styles = templateData.stylesData;
-        const analysis = templateData.analysis;
-
-        if (!styles) return getDefaultStyleInfo();
-
-        // Get header row style
-        const headerRow = analysis.columnHeaderRow.row;
-        const headerStyleIdx = parseInt(headerRow.cells[0]?.s || '0');
-        const headerXf = styles.cellXfs[headerStyleIdx] || {};
-        const headerFont = styles.fonts[headerXf.fontId] || {};
-        const headerFill = styles.fills[headerXf.fillId] || {};
-        const headerBorder = styles.borders[headerXf.borderId] || {};
-
-        // Get data row style (first data row)
-        const dataRows = analysis.dataZone.dataRows;
-        const dataStyleIdx = dataRows.length > 0 ? parseInt(dataRows[0].row.cells[1]?.s || '0') : 0;
-        const dataXf = styles.cellXfs[dataStyleIdx] || {};
-        const dataFont = styles.fonts[dataXf.fontId] || {};
-        const dataBorder = styles.borders[dataXf.borderId] || {};
-
-        // Even row fill (alternating)
-        let evenFillColor = null;
-        if (dataRows.length > 1) {
-            const evenStyleIdx = parseInt(dataRows[1].row.cells[1]?.s || '0');
-            const evenXf = styles.cellXfs[evenStyleIdx] || {};
-            const evenFill = styles.fills[evenXf.fillId] || {};
-            evenFillColor = resolveFillColor(evenFill);
-        }
-
-        return {
-            headerFontSize: headerFont.size || 11,
-            headerFontBold: headerFont.bold !== false,
-            headerFontColor: resolveFontColor(headerFont) || '000000',
-            headerFillColor: resolveFillColor(headerFill) || '4472C4',
-            headerBorder: headerBorder,
-            headerRowHeight: (parseFloat(headerRow.ht) || 20) * PT_TO_MM,
-            headerAlignment: headerXf.alignment || { horizontal: 'center', vertical: 'center' },
-
-            dataFontSize: dataFont.size || 10,
-            dataFontColor: resolveFontColor(dataFont) || '000000',
-            dataBorder: dataBorder,
-            dataRowHeight: (parseFloat(analysis.dataZone.stylePatterns[0]?.ht) || DEFAULT_ROW_HEIGHT) * PT_TO_MM,
-            dataAlignment: dataXf.alignment || { horizontal: 'left', vertical: 'center' },
-
-            evenFillColor: evenFillColor,
-
-            // Per-column alignments from style patterns
-            columnAlignments: extractColumnAlignments(analysis, styles),
-        };
-    }
-
-    function getDefaultStyleInfo() {
-        return {
-            headerFontSize: 11,
-            headerFontBold: true,
-            headerFontColor: 'FFFFFF',
-            headerFillColor: '4472C4',
-            headerBorder: {},
-            headerRowHeight: 8,
-            headerAlignment: { horizontal: 'center', vertical: 'center' },
-
-            dataFontSize: 10,
-            dataFontColor: '333333',
-            dataBorder: {},
-            dataRowHeight: 6,
-            dataAlignment: { horizontal: 'left', vertical: 'center' },
-
-            evenFillColor: 'F2F2F2',
-            columnAlignments: [],
-        };
-    }
-
-    function extractColumnAlignments(analysis, styles) {
-        const patterns = analysis.dataZone.stylePatterns;
-        if (patterns.length === 0) return [];
-        const firstPattern = patterns[0].pattern;
-        return firstPattern.map(p => {
-            const xf = styles.cellXfs[parseInt(p.style)] || {};
-            return xf.alignment || null;
-        });
-    }
-
-    function resolveFontColor(font) {
-        if (font.colorRgb && font.colorRgb.length >= 6) {
-            // Remove leading FF if ARGB
-            return font.colorRgb.length === 8 ? font.colorRgb.substring(2) : font.colorRgb;
-        }
-        if (font.colorTheme !== null && font.colorTheme !== undefined) {
-            const theme = parseInt(font.colorTheme);
-            if (theme >= 0 && theme < THEME_COLORS.length) return THEME_COLORS[theme];
-        }
-        return null;
-    }
-
-    function resolveFillColor(fill) {
-        if (!fill) return null;
-        if (fill.pattern === 'none' || fill.pattern === 'gray125') return null;
-        if (fill.fgColorRgb && fill.fgColorRgb.length >= 6) {
-            return fill.fgColorRgb.length === 8 ? fill.fgColorRgb.substring(2) : fill.fgColorRgb;
-        }
-        if (fill.fgColorTheme !== null && fill.fgColorTheme !== undefined) {
-            const theme = parseInt(fill.fgColorTheme);
-            if (theme >= 0 && theme < THEME_COLORS.length) return THEME_COLORS[theme];
-        }
-        return null;
-    }
-
-    function hexToRgb(hex) {
-        if (!hex) return [0, 0, 0];
-        hex = hex.replace('#', '');
-        return [
-            parseInt(hex.substring(0, 2), 16),
-            parseInt(hex.substring(2, 4), 16),
-            parseInt(hex.substring(4, 6), 16),
-        ];
-    }
-
-    /**
-     * Calculate column widths proportionally fitted to content width
-     */
-    function calculateColumnWidths(headers, rows, contentW, templateData) {
-        let rawWidths;
-
-        if (templateData && templateData.analysis.columns.length > 0) {
-            // Use template column widths
-            rawWidths = headers.map((_, i) => {
-                const col = templateData.analysis.columns.find(c => {
-                    const min = parseInt(c.min);
-                    const max = parseInt(c.max);
-                    return (i + 1) >= min && (i + 1) <= max;
-                });
-                return col ? parseFloat(col.width) * EXCEL_COL_WIDTH_TO_MM : MIN_COL_WIDTH_MM;
-            });
-        } else {
-            // Auto-calculate from content
-            rawWidths = headers.map((h, i) => {
-                let maxLen = String(h).length;
-                const sampleRows = rows.slice(0, 50);
-                for (const row of sampleRows) {
-                    const len = String(row[i] || '').length;
-                    if (len > maxLen) maxLen = len;
-                }
-                return Math.max(maxLen * 2.0, MIN_COL_WIDTH_MM);
-            });
-        }
-
-        // Scale to fit contentW
-        const totalRaw = rawWidths.reduce((a, b) => a + b, 0);
-        const scale = contentW / totalRaw;
-        return rawWidths.map(w => w * scale);
-    }
-
-    /**
-     * Split rows into pages
-     */
-    function paginateRows(rows, contentH, headerH, dataH, headerZoneH) {
-        const pages = [];
-        let idx = 0;
-
-        while (idx < rows.length) {
-            const isFirstPage = pages.length === 0;
-            const availableH = contentH - headerH - (isFirstPage ? headerZoneH : 0) - 8; // 8mm for page number
-            const maxRows = Math.floor(availableH / dataH);
-            const pageRows = rows.slice(idx, idx + maxRows);
-
-            pages.push({
-                rows: pageRows,
-                startRowNum: idx + 1,
-            });
-            idx += pageRows.length;
-        }
-
-        if (pages.length === 0) {
-            pages.push({ rows: [], startRowNum: 1 });
-        }
-
-        return pages;
-    }
-
-    /**
-     * Extract header zone info from template (company name, address, title, etc.)
-     */
-    function extractHeaderZoneInfo(templateData) {
-        const analysis = templateData.analysis;
-        const headerRows = analysis.headerZone.rows;
-        if (headerRows.length === 0) return null;
-
-        const items = [];
-        let totalHeight = 0;
-
-        for (const row of headerRows) {
-            const ht = parseFloat(row.ht) || DEFAULT_ROW_HEIGHT;
-            const heightMm = ht * PT_TO_MM;
-
-            const cells = row.cells.map(c => ({
-                col: c.col,
-                text: c.displayValue || '',
-                style: c.s,
-            })).filter(c => c.text.trim().length > 0);
-
-            if (cells.length > 0) {
-                items.push({
-                    cells,
-                    height: heightMm,
-                    rowNum: row.rowNum,
-                });
-            }
-            totalHeight += heightMm;
-        }
-
-        return { items, totalHeight };
-    }
-
-    /**
-     * Render header zone (company info, title) directly to jsPDF
-     */
-    function renderHeaderZone(doc, headerZoneInfo, x, y, contentW, fontName) {
-        const styles = doc.__templateStyles || null;
-
-        for (const item of headerZoneInfo.items) {
-            for (const cell of item.cells) {
-                // Simple approach: center text if one cell, left-align otherwise
-                const fontSize = Math.max(8, Math.min(14, item.height / PT_TO_MM * 0.4));
-                doc.setFontSize(fontSize);
-
-                // Detect if this looks like a title (large text, centered)
-                const isTitle = item.cells.length === 1 && cell.text.length > 5 && cell.text.length < 80;
-                if (isTitle) {
-                    doc.setFont(fontName, 'bold');
-                    doc.text(cell.text, x + contentW / 2, y + item.height * 0.7, { align: 'center' });
-                } else {
-                    doc.setFont(fontName, 'normal');
-                    const cellX = x + (cell.col - 1) * (contentW / 8); // rough positioning
-                    doc.text(cell.text, cellX, y + item.height * 0.7);
-                }
-            }
-            y += item.height;
-        }
-
-        return y + 2; // small gap after header zone
-    }
-
-    /**
-     * Render table column headers
-     */
-    function renderTableHeaders(doc, headers, colWidths, x, y, styleInfo, fontName) {
-        const h = styleInfo.headerRowHeight;
-        const fillRgb = hexToRgb(styleInfo.headerFillColor);
-        const fontRgb = hexToRgb(styleInfo.headerFontColor);
-
-        // Draw header background
-        let cellX = x;
-        for (let i = 0; i < headers.length; i++) {
-            doc.setFillColor(fillRgb[0], fillRgb[1], fillRgb[2]);
-            doc.rect(cellX, y, colWidths[i], h, 'F');
-
-            // Border
-            doc.setDrawColor(200, 200, 200);
-            doc.setLineWidth(0.2);
-            doc.rect(cellX, y, colWidths[i], h, 'S');
-
-            // Text
-            doc.setFont(fontName, 'bold');
-            doc.setFontSize(Math.min(styleInfo.headerFontSize, 10));
-            doc.setTextColor(fontRgb[0], fontRgb[1], fontRgb[2]);
-
-            const text = truncateText(doc, String(headers[i]), colWidths[i] - CELL_PADDING_MM * 2);
-            doc.text(text, cellX + colWidths[i] / 2, y + h / 2 + 1, {
-                align: 'center',
-                baseline: 'middle',
+            await doc.html(container, {
+                x: margins.left,
+                y: margins.top,
+                width: pw - margins.left - margins.right,
+                windowWidth: (pw - margins.left - margins.right) * 3.78, // mm to px ratio
+                autoPaging: 'text',
+                margin: [margins.top, margins.right, margins.bottom, margins.left],
+                html2canvas: {
+                    scale: 2,
+                    useCORS: true,
+                    logging: false,
+                },
             });
 
-            cellX += colWidths[i];
-        }
-
-        doc.setTextColor(0, 0, 0);
-        return y + h;
-    }
-
-    /**
-     * Render data rows
-     */
-    function renderTableRows(doc, rows, colWidths, x, y, styleInfo, fontName, startRowNum) {
-        const fontRgb = hexToRgb(styleInfo.dataFontColor);
-        const evenFillRgb = styleInfo.evenFillColor ? hexToRgb(styleInfo.evenFillColor) : null;
-        const h = styleInfo.dataRowHeight;
-
-        for (let ri = 0; ri < rows.length; ri++) {
-            const row = rows[ri];
-            const isEven = ri % 2 === 1;
-
-            let cellX = x;
-            for (let ci = 0; ci < Math.min(row.length, colWidths.length); ci++) {
-                // Fill
-                if (isEven && evenFillRgb) {
-                    doc.setFillColor(evenFillRgb[0], evenFillRgb[1], evenFillRgb[2]);
-                    doc.rect(cellX, y, colWidths[ci], h, 'F');
-                }
-
-                // Border
-                doc.setDrawColor(210, 210, 210);
-                doc.setLineWidth(0.15);
-                doc.rect(cellX, y, colWidths[ci], h, 'S');
-
-                // Text
-                doc.setFont(fontName, 'normal');
-                doc.setFontSize(Math.min(styleInfo.dataFontSize, 9));
-                doc.setTextColor(fontRgb[0], fontRgb[1], fontRgb[2]);
-
-                const cellVal = String(row[ci] || '');
-                const text = truncateText(doc, cellVal, colWidths[ci] - CELL_PADDING_MM * 2);
-
-                // Determine alignment
-                const colAlign = styleInfo.columnAlignments[ci];
-                let align = 'left';
-                let textX = cellX + CELL_PADDING_MM;
-                if (colAlign && colAlign.horizontal) {
-                    align = colAlign.horizontal;
-                } else if (isNumericStr(cellVal)) {
-                    align = 'right';
-                } else if (ci === 0) {
-                    align = 'center'; // First column (No.) centered
-                }
-
-                if (align === 'center') {
-                    textX = cellX + colWidths[ci] / 2;
-                } else if (align === 'right') {
-                    textX = cellX + colWidths[ci] - CELL_PADDING_MM;
-                }
-
-                doc.text(text, textX, y + h / 2 + 0.8, {
-                    align: align,
-                    baseline: 'middle',
-                });
-
-                cellX += colWidths[ci];
-            }
-            y += h;
-        }
-
-        doc.setTextColor(0, 0, 0);
-        return y;
-    }
-
-    /**
-     * Render footer zone (totals, notes)
-     */
-    function renderFooterZone(doc, templateData, x, y, colWidths, styleInfo, fontName) {
-        const analysis = templateData.analysis;
-        const footerRows = analysis.footerZone.rows;
-        if (footerRows.length === 0) return;
-
-        y += 0.5; // Small gap
-
-        for (const row of footerRows) {
-            const h = (parseFloat(row.ht) || DEFAULT_ROW_HEIGHT) * PT_TO_MM;
-
-            for (const cell of row.cells) {
-                const colIdx = cell.col - 1;
-                if (colIdx >= colWidths.length) continue;
-
-                // Calculate x position
-                let cellX = x;
-                for (let i = 0; i < colIdx; i++) {
-                    cellX += colWidths[i];
-                }
-                const w = colWidths[colIdx] || 20;
-
-                // Render text
-                const text = cell.displayValue || '';
-                if (text.trim().length > 0) {
-                    // Check if it's a total/summary row
-                    const isTotal = text.includes('合計') || text.includes('小計') ||
-                        text.includes('Total') || text.includes('Tổng') ||
-                        text.includes('消費税');
-
-                    doc.setFont(fontName, isTotal ? 'bold' : 'normal');
-                    doc.setFontSize(styleInfo.dataFontSize);
-
-                    // Border for footer cells
-                    doc.setDrawColor(180, 180, 180);
-                    doc.setLineWidth(0.2);
-                    doc.rect(cellX, y, w, h, 'S');
-
-                    const truncated = truncateText(doc, text, w - CELL_PADDING_MM * 2);
-
-                    if (isNumericStr(text)) {
-                        doc.text(truncated, cellX + w - CELL_PADDING_MM, y + h / 2 + 0.8, {
-                            align: 'right', baseline: 'middle'
-                        });
-                    } else {
-                        doc.text(truncated, cellX + CELL_PADDING_MM, y + h / 2 + 0.8, {
-                            baseline: 'middle'
-                        });
-                    }
-                }
-            }
-            y += h;
+            return doc.output('blob');
+        } finally {
+            document.body.removeChild(container);
         }
     }
 
-    /**
-     * Truncate text to fit within a given width
-     */
-    function truncateText(doc, text, maxWidth) {
-        if (!text || maxWidth <= 0) return '';
-        const textWidth = doc.getTextWidth(text);
-        if (textWidth <= maxWidth) return text;
-
-        // Binary search for the right truncation point
-        let lo = 0, hi = text.length;
-        while (lo < hi - 1) {
-            const mid = Math.floor((lo + hi) / 2);
-            if (doc.getTextWidth(text.substring(0, mid) + '…') <= maxWidth) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        return text.substring(0, lo) + '…';
+    function escapeHtml(str) {
+        if (!str) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
     }
 
     function isNumericStr(s) {
