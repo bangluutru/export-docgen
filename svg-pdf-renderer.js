@@ -147,12 +147,45 @@ const SVGPDFRenderer = (() => {
         const PX_PER_MM = 3.78; // 96 dpi
         const contentWidthPX = Math.round(contentWidthMM * PX_PER_MM);
 
-        // Scale column widths to fit page width
-        let totalExcelW = 0;
-        for (let c = 1; c <= maxCol; c++) totalExcelW += (colWidths[c] || 8.43);
+        // Content-aware column width calculation
+        // Scan all cells to determine optimal width per column based on content
+        const colMaxChars = {};
+        for (let c = 1; c <= maxCol; c++) colMaxChars[c] = 3; // minimum 3 chars
+
+        for (const row of allFinalRows) {
+            for (const cell of row.cells) {
+                const text = cell.display || '';
+                // Estimate char width: CJK chars ≈ 2 units, ASCII ≈ 1 unit
+                let charWidth = 0;
+                for (const ch of text) {
+                    charWidth += ch.charCodeAt(0) > 0x7F ? 1.8 : 1;
+                }
+
+                // For merged cells, don't count — the width spans multiple columns
+                const mergeKey = `${row.rowNum},${cell.colNum}`;
+                const merge = mergeMap[mergeKey];
+                if (merge && merge.isOrigin && merge.colspan > 1) continue;
+
+                if (charWidth > colMaxChars[cell.colNum]) {
+                    colMaxChars[cell.colNum] = Math.min(charWidth, 40); // cap at 40 chars
+                }
+            }
+        }
+
+        // Also factor in Excel column widths as a baseline
+        let totalWeight = 0;
+        const colWeights = {};
+        for (let c = 1; c <= maxCol; c++) {
+            const contentW = colMaxChars[c] * 7; // ~7px per char at 10px font
+            const excelW = (colWidths[c] || 8.43) * 7; // Excel width units to px
+            // Blend: 70% content-based, 30% Excel-based
+            colWeights[c] = Math.max(contentW * 0.7 + excelW * 0.3, 25);
+            totalWeight += colWeights[c];
+        }
+
         const colPxWidths = {};
         for (let c = 1; c <= maxCol; c++) {
-            colPxWidths[c] = Math.round(((colWidths[c] || 8.43) / totalExcelW) * contentWidthPX);
+            colPxWidths[c] = Math.round((colWeights[c] / totalWeight) * contentWidthPX);
         }
 
         // 10. Build HTML table
@@ -274,12 +307,17 @@ const SVGPDFRenderer = (() => {
 
     function borderSideCSS(side, b) {
         if (!b || !b.style) return '';
-        const widths = { thin: '1px', medium: '2px', thick: '3px', hair: '0.5px' };
-        const w = widths[b.style] || '1px';
-        let color = '#000';
+        const widths = { thin: '0.5px', medium: '1.5px', thick: '2px', hair: '0.5px' };
+        const w = widths[b.style] || '0.5px';
+        // Use subtle gray borders for aesthetics
+        let color = '#aaa';
+        if (b.style === 'medium' || b.style === 'thick') color = '#666';
         if (b.color) {
             const resolved = b.color.length === 8 ? b.color.substring(2) : b.color;
-            color = '#' + resolved;
+            // Only use explicit color if it's not auto-black
+            if (resolved !== '000000' && resolved !== 'FF000000') {
+                color = '#' + resolved;
+            }
         }
         return `border-${side}:${w} solid ${color};`;
     }
