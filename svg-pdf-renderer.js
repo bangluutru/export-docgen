@@ -227,7 +227,7 @@ const SVGPDFRenderer = (() => {
 
     function buildCellCSS(cell, styles) {
         let css = 'padding:1px 3px; overflow:hidden; white-space:nowrap; vertical-align:middle;';
-        if (!cell) return css + 'border:0.5px solid #ccc;';
+        if (!cell) return css;
 
         const xf = styles.xfs[cell.s] || {};
         const font = styles.fonts[xf.fontId] || {};
@@ -240,8 +240,16 @@ const SVGPDFRenderer = (() => {
         css += `font-size:${fontSize}px;`;
         if (font.bold) css += 'font-weight:bold;';
 
-        const fontColor = resolveColor(font.colorRgb, font.colorTheme);
-        if (fontColor && fontColor !== 'FFFFFF') css += `color:#${fontColor};`;
+        // Font color: default to BLACK. Only override with explicit RGB (not theme+tint).
+        // Theme colors with tint produce gray text — we want solid black for readability.
+        css += 'color:#000000;';
+        if (font.colorRgb) {
+            const rgb = font.colorRgb.length === 8 ? font.colorRgb.substring(2) : font.colorRgb;
+            // Only apply non-white, non-near-black colors (actual colored text)
+            if (rgb !== '000000' && rgb !== 'FFFFFF' && rgb !== 'FF000000') {
+                css += `color:#${rgb};`;
+            }
+        }
 
         // Fill
         const bg = resolveFillColor(fill);
@@ -255,16 +263,11 @@ const SVGPDFRenderer = (() => {
         if (align.vertical === 'center') css += 'vertical-align:middle;';
         else if (align.vertical === 'top') css += 'vertical-align:top;';
 
-        // Borders
+        // Borders — only draw if explicitly defined in template
         css += borderSideCSS('top', border.top);
         css += borderSideCSS('bottom', border.bottom);
         css += borderSideCSS('left', border.left);
         css += borderSideCSS('right', border.right);
-
-        // Default thin border if no borders specified
-        if (!border.top && !border.bottom && !border.left && !border.right) {
-            css += 'border:0.5px solid #ddd;';
-        }
 
         return css;
     }
