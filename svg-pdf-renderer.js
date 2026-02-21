@@ -148,14 +148,22 @@ const SVGPDFRenderer = (() => {
         const contentWidthPX = Math.round(contentWidthMM * PX_PER_MM);
 
         // Content-aware column width calculation
-        // Scan all cells to determine optimal width per column based on content
+        // Scan data cells to determine optimal width per column based on content.
+        // Ignore general header/footer rows because they often contain long text (like company addresses)
+        // in column A without colspans, which distorts the width of the "No." column.
         const colMaxChars = {};
         for (let c = 1; c <= maxCol; c++) colMaxChars[c] = 3; // minimum 3 chars
 
-        for (const row of allFinalRows) {
+        const rowsToScan = [...newDataRows];
+        // Ensure we include the template's column headers (usually the last row before dataStart)
+        if (headerRows.length > 0) {
+            rowsToScan.push(headerRows[headerRows.length - 1]);
+        }
+
+        for (const row of rowsToScan) {
             for (const cell of row.cells) {
                 const text = cell.display || '';
-                // Estimate char width: CJK chars ≈ 2 units, ASCII ≈ 1 unit
+                // Estimate char width: CJK chars ≈ 1.8 units, ASCII ≈ 1 unit
                 let charWidth = 0;
                 for (const ch of text) {
                     charWidth += ch.charCodeAt(0) > 0x7F ? 1.8 : 1;
@@ -164,7 +172,7 @@ const SVGPDFRenderer = (() => {
                 // For merged cells, don't count — the width spans multiple columns
                 const mergeKey = `${row.rowNum},${cell.colNum}`;
                 const merge = mergeMap[mergeKey];
-                if (merge && merge.isOrigin && merge.colspan > 1) continue;
+                if ((merge && merge.isOrigin && merge.colspan > 1) || (merge && !merge.isOrigin)) continue;
 
                 if (charWidth > colMaxChars[cell.colNum]) {
                     colMaxChars[cell.colNum] = Math.min(charWidth, 40); // cap at 40 chars
