@@ -501,7 +501,7 @@
             return;
         }
 
-        showLoading('Đang tải font Unicode...');
+        showLoading('Đang tạo PDF...');
         try {
             const pgSize = $('pageSize').value;
             const isLandscape = $('landscape').checked;
@@ -515,50 +515,57 @@
                 ? mapDataToTemplate(sheet)
                 : sheet.rows;
 
-            const doc = new jsPDFLib.jsPDF({
-                orientation: isLandscape ? 'landscape' : 'portrait',
-                unit: 'mm',
-                format: pgSize,
-            });
+            // Use SVG-PDF renderer (style-aware, smaller output)
+            if (typeof SVGPDFRenderer !== 'undefined') {
+                const blob = await SVGPDFRenderer.renderToPDF({
+                    headers: headers,
+                    rows: rows,
+                    templateData: templateData || null,
+                    title: templateData ? '' : title, // Template has its own header zone
+                    pageSize: pgSize,
+                    landscape: isLandscape,
+                });
 
-            // Register Noto Sans JP Unicode font (lazy-loaded on first use)
-            if (typeof FontLoader !== 'undefined') {
-                await FontLoader.registerFont(doc);
-                showLoading('Đang tạo PDF...');
+                const safeName = (selectedSheet || 'export').replace(/[\\/:*?"<>|]/g, '_');
+                saveAs(blob, `${safeName}.pdf`);
+
+                const sizeKB = (blob.size / 1024).toFixed(0);
+                showToast(`PDF tải thành công! (${sizeKB} KB)`, 'success');
+            } else {
+                // Fallback: old jsPDF autoTable approach
+                showLoading('Đang tải font Unicode...');
+
+                const doc = new jsPDFLib.jsPDF({
+                    orientation: isLandscape ? 'landscape' : 'portrait',
+                    unit: 'mm',
+                    format: pgSize,
+                });
+
+                if (typeof FontLoader !== 'undefined') {
+                    await FontLoader.registerFont(doc);
+                    showLoading('Đang tạo PDF...');
+                }
+
+                const fontName = (typeof FontLoader !== 'undefined' && FontLoader.isLoaded()) ? 'NotoSans' : 'helvetica';
+                doc.setFontSize(16);
+                doc.setFont(fontName, 'bold');
+                const pageWidth = doc.internal.pageSize.getWidth();
+                doc.text(title, pageWidth / 2, 15, { align: 'center' });
+
+                doc.autoTable({
+                    head: [headers],
+                    body: rows,
+                    startY: 25,
+                    styles: { font: fontName, fontSize: 9, cellPadding: 3 },
+                    headStyles: { fillColor: [99, 102, 241], textColor: 255, fontStyle: 'bold', halign: 'center' },
+                    alternateRowStyles: { fillColor: [245, 245, 255] },
+                    margin: { top: 10, right: 10, bottom: 10, left: 10 },
+                });
+
+                const safeName = (selectedSheet || 'export').replace(/[\\/:*?"<>|]/g, '_');
+                doc.save(`${safeName}.pdf`);
+                showToast('Đã tải PDF thành công!', 'success');
             }
-
-            // Title
-            const fontName = (typeof FontLoader !== 'undefined' && FontLoader.isLoaded()) ? 'NotoSans' : 'helvetica';
-            doc.setFontSize(16);
-            doc.setFont(fontName, 'bold');
-            const pageWidth = doc.internal.pageSize.getWidth();
-            doc.text(title, pageWidth / 2, 15, { align: 'center' });
-
-            // Table
-            doc.autoTable({
-                head: [headers],
-                body: rows,
-                startY: 25,
-                styles: {
-                    font: fontName,
-                    fontSize: 9,
-                    cellPadding: 3,
-                },
-                headStyles: {
-                    fillColor: [99, 102, 241],
-                    textColor: 255,
-                    fontStyle: 'bold',
-                    halign: 'center',
-                },
-                alternateRowStyles: {
-                    fillColor: [245, 245, 255],
-                },
-                margin: { top: 10, right: 10, bottom: 10, left: 10 },
-            });
-
-            const safeName = (selectedSheet || 'export').replace(/[\\/:*?"<>|]/g, '_');
-            doc.save(`${safeName}.pdf`);
-            showToast('Đã tải PDF thành công!', 'success');
         } catch (err) {
             console.error('PDF export error:', err);
             showToast('Lỗi xuất PDF: ' + err.message, 'error');

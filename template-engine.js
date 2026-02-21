@@ -1,6 +1,6 @@
 /**
  * Template Engine — Analyze template XLSX and generate new files using template formatting
- * Approach: Clone the template ZIP entirely, only replacing data area rows
+ * Approach: Surgical DOM manipulation — only replace data zone rows, preserve everything else
  */
 const TemplateEngine = (() => {
     const XLSX_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
@@ -27,6 +27,11 @@ const TemplateEngine = (() => {
         return col;
     }
 
+    function refToRow(ref) {
+        const match = ref.match(/(\d+)$/);
+        return match ? parseInt(match[1], 10) : 1;
+    }
+
     function escapeXml(str) {
         if (str == null) return '';
         return String(str)
@@ -51,8 +56,8 @@ const TemplateEngine = (() => {
     async function analyzeTemplate(buffer) {
         const zip = await JSZip.loadAsync(buffer);
 
-        // Parse shared strings
-        const sharedStrings = await parseSharedStrings(zip);
+        // Parse shared strings — keep both text and raw XML
+        const { strings: sharedStrings, rawSiElements } = await parseSharedStrings(zip);
 
         // Parse workbook to get sheet names
         const wbXml = await zip.file('xl/workbook.xml').async('string');
@@ -86,33 +91,156 @@ const TemplateEngine = (() => {
         const firstSheetPath = relMap[sheets[0].rId];
         const analysis = await analyzeSheet(zip, firstSheetPath, sharedStrings);
 
+        // Parse styles.xml for later PDF rendering use
+        const stylesData = await parseStyles(zip);
+
         return {
             zip: zip,
             sheets: sheets,
             relMap: relMap,
             sharedStrings: sharedStrings,
+            rawSiElements: rawSiElements,
             firstSheetPath: firstSheetPath,
             analysis: analysis,
             sheetNames: sheets.map(s => s.name),
+            stylesData: stylesData,
         };
     }
 
+    /**
+     * Parse shared strings, preserving raw XML for rich text
+     */
     async function parseSharedStrings(zip) {
         const file = zip.file('xl/sharedStrings.xml');
-        if (!file) return [];
+        if (!file) return { strings: [], rawSiElements: [] };
+
         const xml = await file.async('string');
         const doc = new DOMParser().parseFromString(xml, 'application/xml');
         const items = doc.getElementsByTagName('si');
         const strings = [];
+        const rawSiElements = [];
+        const serializer = new XMLSerializer();
+
         for (let i = 0; i < items.length; i++) {
+            // Extract display text
             const tNodes = items[i].getElementsByTagName('t');
             let text = '';
             for (let j = 0; j < tNodes.length; j++) {
                 text += tNodes[j].textContent || '';
             }
             strings.push(text);
+            // Keep raw XML for preserving rich text formatting
+            rawSiElements.push(serializer.serializeToString(items[i]));
         }
-        return strings;
+        return { strings, rawSiElements };
+    }
+
+    /**
+     * Parse xl/styles.xml for colors, fonts, fills, borders, number formats
+     */
+    async function parseStyles(zip) {
+        const file = zip.file('xl/styles.xml');
+        if (!file) return null;
+        const xml = await file.async('string');
+        const doc = new DOMParser().parseFromString(xml, 'application/xml');
+
+        // Parse number formats
+        const numFmts = {};
+        const nfNodes = doc.getElementsByTagName('numFmt');
+        for (let i = 0; i < nfNodes.length; i++) {
+            const id = nfNodes[i].getAttribute('numFmtId');
+            numFmts[id] = nfNodes[i].getAttribute('formatCode');
+        }
+
+        // Parse fonts
+        const fonts = [];
+        const fontsNode = doc.getElementsByTagName('fonts')[0];
+        if (fontsNode) {
+            const fontNodes = fontsNode.querySelectorAll(':scope > font');
+            for (const fn of fontNodes) {
+                const font = {};
+                const sz = fn.getElementsByTagName('sz')[0];
+                if (sz) font.size = parseFloat(sz.getAttribute('val'));
+                const name = fn.getElementsByTagName('name')[0];
+                if (name) font.name = name.getAttribute('val');
+                const color = fn.getElementsByTagName('color')[0];
+                if (color) {
+                    font.colorRgb = color.getAttribute('rgb');
+                    font.colorTheme = color.getAttribute('theme');
+                }
+                font.bold = fn.getElementsByTagName('b').length > 0;
+                font.italic = fn.getElementsByTagName('i').length > 0;
+                font.underline = fn.getElementsByTagName('u').length > 0;
+                fonts.push(font);
+            }
+        }
+
+        // Parse fills
+        const fills = [];
+        const fillsNode = doc.getElementsByTagName('fills')[0];
+        if (fillsNode) {
+            const fillNodes = fillsNode.querySelectorAll(':scope > fill');
+            for (const fl of fillNodes) {
+                const fill = {};
+                const pf = fl.getElementsByTagName('patternFill')[0];
+                if (pf) {
+                    fill.pattern = pf.getAttribute('patternType');
+                    const fgColor = pf.getElementsByTagName('fgColor')[0];
+                    if (fgColor) {
+                        fill.fgColorRgb = fgColor.getAttribute('rgb');
+                        fill.fgColorTheme = fgColor.getAttribute('theme');
+                    }
+                }
+                fills.push(fill);
+            }
+        }
+
+        // Parse borders
+        const borders = [];
+        const bordersNode = doc.getElementsByTagName('borders')[0];
+        if (bordersNode) {
+            const borderNodes = bordersNode.querySelectorAll(':scope > border');
+            for (const bn of borderNodes) {
+                const border = {};
+                for (const side of ['left', 'right', 'top', 'bottom']) {
+                    const sideNode = bn.getElementsByTagName(side)[0];
+                    if (sideNode && sideNode.getAttribute('style')) {
+                        const colorNode = sideNode.getElementsByTagName('color')[0];
+                        border[side] = {
+                            style: sideNode.getAttribute('style'),
+                            colorRgb: colorNode ? colorNode.getAttribute('rgb') : null,
+                        };
+                    }
+                }
+                borders.push(border);
+            }
+        }
+
+        // Parse cell style xfs (cellXfs)
+        const cellXfs = [];
+        const xfsNode = doc.getElementsByTagName('cellXfs')[0];
+        if (xfsNode) {
+            const xfNodes = xfsNode.querySelectorAll(':scope > xf');
+            for (const xf of xfNodes) {
+                cellXfs.push({
+                    numFmtId: xf.getAttribute('numFmtId') || '0',
+                    fontId: parseInt(xf.getAttribute('fontId') || '0'),
+                    fillId: parseInt(xf.getAttribute('fillId') || '0'),
+                    borderId: parseInt(xf.getAttribute('borderId') || '0'),
+                    alignment: (() => {
+                        const al = xf.getElementsByTagName('alignment')[0];
+                        if (!al) return null;
+                        return {
+                            horizontal: al.getAttribute('horizontal'),
+                            vertical: al.getAttribute('vertical'),
+                            wrapText: al.getAttribute('wrapText') === '1',
+                        };
+                    })(),
+                });
+            }
+        }
+
+        return { numFmts, fonts, fills, borders, cellXfs };
     }
 
     /**
@@ -161,24 +289,18 @@ const TemplateEngine = (() => {
         }
 
         // Detect column headers row
-        // Strategy: find a row where multiple cells look like headers (short text, often bold font)
-        // and there's a "No." or sequential numbering pattern starting after it
         let headerRowIdx = -1;
         let headerRow = null;
 
         for (let i = 0; i < rows.length; i++) {
             const r = rows[i];
             if (r.cells.length >= 3) {
-                // Check if this looks like a header row
                 const texts = r.cells.map(c => c.displayValue);
                 const looksLikeHeaders = texts.every(t => t.length < 30) && texts.filter(t => t.length > 0).length >= 3;
-                // Check if next row has numbered first column
                 if (looksLikeHeaders && i + 1 < rows.length) {
                     const nextRow = rows[i + 1];
                     const hasNextData = nextRow && nextRow.cells.length > 0;
-                    // Check if row after this looks like data (has sequential numbers or values)  
                     if (hasNextData) {
-                        // Look for typical header indicators
                         const hasNoColumn = texts.some(t =>
                             t === 'No.' || t === 'No' || t === 'STT' || t === '#' || t === '番号'
                         );
@@ -192,7 +314,7 @@ const TemplateEngine = (() => {
             }
         }
 
-        // Fallback: if no header found, look for the first row with many cells
+        // Fallback: first row with many cells
         if (headerRowIdx === -1) {
             let maxCells = 0;
             for (let i = 0; i < Math.min(rows.length, 20); i++) {
@@ -204,21 +326,19 @@ const TemplateEngine = (() => {
             }
         }
 
-        // Everything before header = header zone (company info, title, etc.)
+        // Header zone
         const headerZoneRows = rows.slice(0, headerRowIdx);
 
-        // Find data zone: rows after header row where first column has sequential numbers
+        // Find data zone
         let dataStartIdx = headerRowIdx + 1;
-        // Skip any sub-category rows (merged rows between header and first data)
         while (dataStartIdx < rows.length) {
             const r = rows[dataStartIdx];
             const firstCellVal = r.cells[0]?.value;
-            // Check if it looks like a data row (first cell is a number)
             if (firstCellVal && !isNaN(parseInt(firstCellVal))) break;
             dataStartIdx++;
         }
 
-        // Find where data ends (look for footer with formulas like SUM)
+        // Find where data ends
         let dataEndIdx = rows.length - 1;
         for (let i = dataStartIdx; i < rows.length; i++) {
             const r = rows[i];
@@ -234,15 +354,13 @@ const TemplateEngine = (() => {
             }
         }
 
-        // Handle the category rows within data (like "Reagent", "Calibrator & Control")
-        // These are merged rows that separate data groups
+        // Categorize data rows
         const categoryRows = [];
         const actualDataRows = [];
         for (let i = dataStartIdx; i <= dataEndIdx; i++) {
             const r = rows[i];
             const firstVal = r.cells[0]?.value;
             if (!firstVal || isNaN(parseInt(firstVal))) {
-                // This might be a category/separator row
                 if (r.cells.length >= 1 && r.cells[0].displayValue.length > 0) {
                     categoryRows.push({ index: i, row: r });
                 }
@@ -254,7 +372,7 @@ const TemplateEngine = (() => {
         // Footer zone
         const footerZoneRows = rows.slice(dataEndIdx + 1);
 
-        // Extract column headers
+        // Column headers
         const columnHeaders = headerRow.cells.map(c => ({
             col: c.col,
             ref: c.ref,
@@ -262,7 +380,7 @@ const TemplateEngine = (() => {
             style: c.s,
         }));
 
-        // Extract style patterns for data rows
+        // Style patterns for data rows
         const dataStylePatterns = [];
         for (const { row } of actualDataRows.slice(0, 4)) {
             const pattern = row.cells.map(c => ({
@@ -296,7 +414,6 @@ const TemplateEngine = (() => {
             });
         }
 
-        // Count max column from header
         const maxCol = Math.max(...headerRow.cells.map(c => c.col));
 
         return {
@@ -332,10 +449,8 @@ const TemplateEngine = (() => {
 
     // --- Template-Based Generation ---
     /**
-     * Generate a new XLSX file using template formatting and new data
-     * @param {Object} templateData - Result from analyzeTemplate()
-     * @param {Object} options - { rows, sheetName, headerOverrides, updateHeaderFields }
-     * @returns {Blob} The generated XLSX file
+     * Generate a new XLSX file using template formatting and new data.
+     * Uses surgical DOM manipulation — only replaces data rows, preserves everything else.
      */
     async function generateFromTemplate(templateData, options) {
         const {
@@ -344,19 +459,20 @@ const TemplateEngine = (() => {
             headerFieldUpdates = {},
         } = options;
 
-        const { zip, analysis, sharedStrings: origSharedStrings } = templateData;
+        const { zip, analysis, sharedStrings: origSharedStrings, rawSiElements } = templateData;
 
         // Clone the template ZIP
         const newZipData = await zip.generateAsync({ type: 'arraybuffer' });
         const newZip = await JSZip.loadAsync(newZipData);
 
-        // Build new shared strings set
+        // Build new shared strings — preserve originals, add new ones
         const newSharedStrings = [...origSharedStrings];
+        const newRawSiElements = [...rawSiElements];
         const ssIndexMap = {};
+
         function getOrAddSharedString(text) {
             const key = String(text);
             if (ssIndexMap[key] !== undefined) return ssIndexMap[key];
-            // Check if already exists
             const existingIdx = newSharedStrings.indexOf(key);
             if (existingIdx !== -1) {
                 ssIndexMap[key] = existingIdx;
@@ -364,6 +480,8 @@ const TemplateEngine = (() => {
             }
             const idx = newSharedStrings.length;
             newSharedStrings.push(key);
+            // New strings are plain text (no rich text)
+            newRawSiElements.push(`<si xmlns="${XLSX_NS}"><t>${escapeXml(key)}</t></si>`);
             ssIndexMap[key] = idx;
             return idx;
         }
@@ -371,21 +489,20 @@ const TemplateEngine = (() => {
         // Pre-index existing strings
         origSharedStrings.forEach((s, i) => { ssIndexMap[s] = i; });
 
-        // --- Rebuild the worksheet XML ---
+        // --- Surgical rebuild of the worksheet XML ---
         const sheetPath = templateData.firstSheetPath;
         const origXml = await zip.file(sheetPath).async('string');
-        const newSheetXml = rebuildSheet(origXml, analysis, newDataRows, getOrAddSharedString, headerFieldUpdates);
+        const newSheetXml = rebuildSheetSurgical(origXml, analysis, newDataRows, getOrAddSharedString, headerFieldUpdates);
 
         newZip.file(sheetPath, newSheetXml);
 
-        // --- Rebuild shared strings XML ---
-        const newSSXml = buildSharedStringsXml(newSharedStrings);
+        // --- Rebuild shared strings XML preserving rich text ---
+        const newSSXml = buildSharedStringsXmlPreserved(newRawSiElements);
         newZip.file('xl/sharedStrings.xml', newSSXml);
 
         // Update sheet name if provided
         if (sheetName) {
             const wbXml = await newZip.file('xl/workbook.xml').async('string');
-            // Update first sheet name
             const updatedWb = wbXml.replace(
                 /(<sheet[^>]*name=")([^"]*)(")/,
                 `$1${escapeXml(sheetName)}$3`
@@ -393,354 +510,360 @@ const TemplateEngine = (() => {
             newZip.file('xl/workbook.xml', updatedWb);
         }
 
-        // Generate blob
+        // Generate blob WITH compression
         const blob = await newZip.generateAsync({
             type: 'blob',
             mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            compression: 'DEFLATE',
+            compressionOptions: { level: 6 },
         });
 
         return blob;
     }
 
     /**
-     * Rebuild sheet XML with new data rows
+     * Surgical rebuild — Modify DOM directly, only replace data zone rows.
+     * Preserves ALL XML elements: conditionalFormatting, dataValidations,
+     * printOptions, sheetPr, autoFilter, hyperlinks, drawings, comments, etc.
      */
-    function rebuildSheet(origXml, analysis, newDataRows, getOrAddSS, headerFieldUpdates) {
+    function rebuildSheetSurgical(origXml, analysis, newDataRows, getOrAddSS, headerFieldUpdates) {
         const doc = new DOMParser().parseFromString(origXml, 'application/xml');
-        const { headerZone, columnHeaderRow, dataZone, footerZone, rawRows, maxCol } = analysis;
+        const sheetData = doc.getElementsByTagName('sheetData')[0];
+        if (!sheetData) return origXml; // Safety fallback
 
-        // Determine style patterns to use for data rows
+        const { columnHeaderRow, dataZone, footerZone, maxCol } = analysis;
         const stylePatterns = dataZone.stylePatterns;
-        if (stylePatterns.length === 0) return origXml; // Shouldn't happen
+        if (stylePatterns.length === 0) return origXml;
 
-        // Get column count from header
         const colCount = columnHeaderRow.headers.length;
+        const dataStartRowNum = dataZone.startRowNum;
+        const origDataEndRowNum = dataZone.endRowNum;
+        const origFooterStartRowNum = footerZone.rows[0]?.rowNum || origDataEndRowNum + 1;
 
-        // Build all row XMLs
-        const allRows = [];
-
-        // === 1. Header Zone (keep as-is, but apply field updates) ===
-        for (const row of headerZone.rows) {
-            let rowXml = buildRowXml(row, headerFieldUpdates, getOrAddSS);
-            allRows.push(rowXml);
+        // === Step 1: Apply header field updates (if any) ===
+        if (Object.keys(headerFieldUpdates).length > 0) {
+            const allRows = sheetData.getElementsByTagName('row');
+            for (let i = 0; i < allRows.length; i++) {
+                const rowNum = parseInt(allRows[i].getAttribute('r'), 10);
+                if (rowNum >= dataStartRowNum) break; // Only update header zone
+                const cells = allRows[i].getElementsByTagName('c');
+                for (let j = 0; j < cells.length; j++) {
+                    const cellRef = cells[j].getAttribute('r');
+                    if (headerFieldUpdates[cellRef] !== undefined) {
+                        updateCellValue(doc, cells[j], headerFieldUpdates[cellRef], getOrAddSS);
+                    }
+                }
+            }
         }
 
-        // === 2. Column Header Row (keep as-is) ===
-        allRows.push(buildRowXml(columnHeaderRow.row, {}, getOrAddSS));
+        // === Step 2: Collect and remove data zone rows ===
+        const rowsToRemove = [];
+        const allRows = sheetData.getElementsByTagName('row');
+        for (let i = allRows.length - 1; i >= 0; i--) {
+            const rowNum = parseInt(allRows[i].getAttribute('r'), 10);
+            if (rowNum >= dataStartRowNum && rowNum <= origDataEndRowNum) {
+                rowsToRemove.push(allRows[i]);
+            }
+        }
+        rowsToRemove.forEach(row => sheetData.removeChild(row));
 
-        // === 3. Data rows with category support ===
-        const dataStartRowNum = dataZone.startRowNum;
-        let currentRowNum = dataStartRowNum;
-
-        // Check if there are category rows in the original — preserve them
-        // But for simplicity, we'll just handle the data rows
-        // If original had category rows, check if we need them
-        const origCategoryRows = dataZone.categoryRows;
-
-        // Determine if original uses R1/R2 pattern (2 rows per item)
+        // === Step 3: Build new data rows ===
         const hasR1R2 = stylePatterns.length >= 2;
         const patternCycleLen = hasR1R2 ? 2 : 1;
+        let currentRowNum = dataStartRowNum;
+        const newDataRowNodes = [];
 
-        let itemNum = 1;
         for (let i = 0; i < newDataRows.length; i++) {
             const dataRow = newDataRows[i];
             const patternIdx = i % patternCycleLen;
             const pattern = stylePatterns[Math.min(patternIdx, stylePatterns.length - 1)];
 
-            const cells = [];
+            const rowEl = doc.createElementNS(XLSX_NS, 'row');
+            rowEl.setAttribute('r', String(currentRowNum));
+            if (pattern.ht) {
+                rowEl.setAttribute('ht', pattern.ht);
+                rowEl.setAttribute('customHeight', '1');
+            }
+
             for (let c = 0; c < colCount; c++) {
                 const colNum = c + 1;
                 const cellRef = colToRef(colNum) + currentRowNum;
                 const patternCell = pattern.pattern.find(p => p.col === colNum);
                 const styleIdx = patternCell ? patternCell.style : '0';
-
                 const cellValue = (dataRow[c] !== undefined && dataRow[c] !== null) ? String(dataRow[c]) : '';
 
-                if (colNum === 1 && isNumeric(cellValue)) {
-                    // First column (No.) — always numeric centered
-                    cells.push(`<c r="${cellRef}" s="${styleIdx}"><v>${cellValue}</v></c>`);
+                const cellEl = doc.createElementNS(XLSX_NS, 'c');
+                cellEl.setAttribute('r', cellRef);
+                cellEl.setAttribute('s', styleIdx);
+
+                if (cellValue === '') {
+                    // Empty cell — just has style
                 } else if (isNumeric(cellValue)) {
-                    // Numeric value
-                    cells.push(`<c r="${cellRef}" s="${styleIdx}"><v>${cellValue}</v></c>`);
-                } else if (cellValue === '') {
-                    cells.push(`<c r="${cellRef}" s="${styleIdx}"/>`);
+                    const vEl = doc.createElementNS(XLSX_NS, 'v');
+                    vEl.textContent = cellValue;
+                    cellEl.appendChild(vEl);
                 } else {
-                    // String value — use shared strings
                     const ssIdx = getOrAddSS(cellValue);
-                    cells.push(`<c r="${cellRef}" s="${styleIdx}" t="s"><v>${ssIdx}</v></c>`);
+                    cellEl.setAttribute('t', 's');
+                    const vEl = doc.createElementNS(XLSX_NS, 'v');
+                    vEl.textContent = String(ssIdx);
+                    cellEl.appendChild(vEl);
                 }
+
+                rowEl.appendChild(cellEl);
             }
 
-            const ht = pattern.ht || '18';
-            allRows.push(`<row r="${currentRowNum}" ht="${ht}" customHeight="1">${cells.join('')}</row>`);
+            newDataRowNodes.push(rowEl);
             currentRowNum++;
         }
 
-        // === 4. Footer Zone ===
-        // Adjust footer row numbers and formula ranges
-        const footerStartRowNum = currentRowNum;
-        const origDataStart = dataZone.startRowNum;
-        const origDataEnd = dataZone.endRowNum;
+        // === Step 4: Find the insertion point (first row after data zone = footer) ===
         const newDataEnd = currentRowNum - 1;
+        const rowShift = newDataEnd - origDataEndRowNum; // How many rows shifted
 
-        for (const row of footerZone.rows) {
-            const newRowNum = footerStartRowNum + (footerZone.rows.indexOf(row));
-            const cells = [];
-            for (const cell of row.cells) {
-                const colNum = cell.col;
-                const cellRef = colToRef(colNum) + newRowNum;
-                let cellXml;
-
-                if (cell.formula) {
-                    // Update formula ranges
-                    let updatedFormula = cell.formula;
-                    // Replace row references in formulas like SUM(H17:H45,H47:H53)
-                    updatedFormula = updateFormulaRanges(updatedFormula, origDataStart, origDataEnd, dataStartRowNum, newDataEnd);
-                    // Also update self-referencing formulas
-                    updatedFormula = updatedFormula.replace(
-                        /H(\d+)/g,
-                        (match, rn) => {
-                            const origRn = parseInt(rn);
-                            if (origRn >= footerZone.rows[0]?.rowNum) {
-                                // Footer row ref — adjust
-                                const offset = origRn - footerZone.rows[0].rowNum;
-                                return `H${footerStartRowNum + offset}`;
-                            }
-                            return match;
-                        }
-                    );
-
-                    if (cell.t === 's') {
-                        const ssIdx = getOrAddSS(cell.displayValue);
-                        cellXml = `<c r="${cellRef}" s="${cell.s}" t="s"><f>${escapeXml(updatedFormula)}</f><v>${ssIdx}</v></c>`;
-                    } else {
-                        cellXml = `<c r="${cellRef}" s="${cell.s}"><f>${escapeXml(updatedFormula)}</f><v>${cell.value}</v></c>`;
-                    }
-                } else if (cell.t === 's') {
-                    const ssIdx = getOrAddSS(cell.displayValue);
-                    cellXml = `<c r="${cellRef}" s="${cell.s}" t="s"><v>${ssIdx}</v></c>`;
-                } else if (cell.value) {
-                    cellXml = `<c r="${cellRef}" s="${cell.s}"><v>${cell.value}</v></c>`;
-                } else {
-                    cellXml = `<c r="${cellRef}" s="${cell.s}"/>`;
-                }
-                cells.push(cellXml);
+        // Find the first footer row in DOM to insert data before it
+        let insertBeforeNode = null;
+        const existingRows = sheetData.getElementsByTagName('row');
+        for (let i = 0; i < existingRows.length; i++) {
+            const rn = parseInt(existingRows[i].getAttribute('r'), 10);
+            if (rn >= origFooterStartRowNum) {
+                insertBeforeNode = existingRows[i];
+                break;
             }
-
-            const ht = row.ht || '18';
-            allRows.push(`<row r="${newRowNum}" ht="${ht}" customHeight="1">${cells.join('')}</row>`);
         }
 
-        // === Rebuild merge cells ===
-        const newMerges = rebuildMergeCells(analysis, newDataRows.length, dataStartRowNum, newDataEnd, footerStartRowNum);
-
-        // === Assemble the full worksheet XML ===
-        // Extract everything we need from original
-        const sheetDataContent = allRows.join('\n');
-
-        // Rebuild the complete XML
-        // We need to preserve: sheetViews, cols, pageMargins, pageSetup, drawing, etc.
-        return buildFullSheetXml(doc, sheetDataContent, newMerges, currentRowNum + footerZone.rows.length - 1, maxCol);
-    }
-
-    function buildRowXml(row, fieldUpdates, getOrAddSS) {
-        const cells = [];
-        for (const cell of row.cells) {
-            const cellRef = cell.ref;
-            let cellXml;
-
-            // Check if this cell should be updated
-            const updateValue = fieldUpdates[cellRef];
-
-            if (updateValue !== undefined) {
-                if (isNumeric(updateValue)) {
-                    cellXml = `<c r="${cellRef}" s="${cell.s}"><v>${updateValue}</v></c>`;
-                } else {
-                    const ssIdx = getOrAddSS(String(updateValue));
-                    cellXml = `<c r="${cellRef}" s="${cell.s}" t="s"><v>${ssIdx}</v></c>`;
-                }
-            } else if (cell.formula) {
-                if (cell.t === 's') {
-                    cellXml = `<c r="${cellRef}" s="${cell.s}" t="s"><f>${escapeXml(cell.formula)}</f><v>${cell.value}</v></c>`;
-                } else {
-                    cellXml = `<c r="${cellRef}" s="${cell.s}"><f>${escapeXml(cell.formula)}</f><v>${cell.value}</v></c>`;
-                }
-            } else if (cell.t === 's') {
-                cellXml = `<c r="${cellRef}" s="${cell.s}" t="s"><v>${cell.value}</v></c>`;
-            } else if (cell.value) {
-                cellXml = `<c r="${cellRef}" s="${cell.s}"><v>${cell.value}</v></c>`;
+        // Insert new data rows
+        for (const rowNode of newDataRowNodes) {
+            if (insertBeforeNode) {
+                sheetData.insertBefore(rowNode, insertBeforeNode);
             } else {
-                cellXml = `<c r="${cellRef}" s="${cell.s}"/>`;
+                sheetData.appendChild(rowNode);
             }
-            cells.push(cellXml);
         }
 
-        const attrs = [`r="${row.rowNum}"`];
-        if (row.ht) attrs.push(`ht="${row.ht}"`);
-        if (row.customHeight) attrs.push(`customHeight="1"`);
-        if (row.hidden) attrs.push(`hidden="1"`);
+        // === Step 5: Adjust footer row numbers ===
+        if (rowShift !== 0) {
+            // Re-fetch rows after insertion
+            const updatedRows = sheetData.getElementsByTagName('row');
+            for (let i = 0; i < updatedRows.length; i++) {
+                const rn = parseInt(updatedRows[i].getAttribute('r'), 10);
+                if (rn >= origFooterStartRowNum) {
+                    const newRn = rn + rowShift;
+                    updatedRows[i].setAttribute('r', String(newRn));
+                    // Update all cell refs in this row
+                    const cells = updatedRows[i].getElementsByTagName('c');
+                    for (let j = 0; j < cells.length; j++) {
+                        const oldRef = cells[j].getAttribute('r');
+                        const colPart = oldRef.match(/^([A-Z]+)/)[1];
+                        cells[j].setAttribute('r', colPart + newRn);
 
-        return `<row ${attrs.join(' ')}>${cells.join('')}</row>`;
+                        // Update formulas in footer
+                        const fEl = cells[j].getElementsByTagName('f')[0];
+                        if (fEl && fEl.textContent) {
+                            fEl.textContent = updateFormulaRangesGeneric(
+                                fEl.textContent,
+                                dataStartRowNum, origDataEndRowNum,
+                                dataStartRowNum, newDataEnd,
+                                origFooterStartRowNum, origFooterStartRowNum + rowShift
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // === Step 6: Update merge cells ===
+        updateMergeCells(doc, dataStartRowNum, origDataEndRowNum, newDataEnd, origFooterStartRowNum, rowShift);
+
+        // === Step 7: Update dimension ref ===
+        const dimNode = doc.getElementsByTagName('dimension')[0];
+        if (dimNode) {
+            const lastRow = (footerZone.rows.length > 0)
+                ? footerZone.rows[footerZone.rows.length - 1].rowNum + rowShift
+                : newDataEnd;
+            const lastCol = colToRef(maxCol || 8);
+            dimNode.setAttribute('ref', `A1:${lastCol}${lastRow}`);
+        }
+
+        // === Step 8: Update autoFilter range if it exists ===
+        const autoFilterNodes = doc.getElementsByTagName('autoFilter');
+        if (autoFilterNodes.length > 0) {
+            const af = autoFilterNodes[0];
+            const afRef = af.getAttribute('ref');
+            if (afRef) {
+                const match = afRef.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+                if (match) {
+                    const [, c1, r1, c2, r2] = match;
+                    const origR2 = parseInt(r2);
+                    if (origR2 >= origDataEndRowNum) {
+                        af.setAttribute('ref', `${c1}${r1}:${c2}${origR2 + rowShift}`);
+                    }
+                }
+            }
+        }
+
+        // === Step 9: Update conditional formatting ranges ===
+        const cfNodes = doc.getElementsByTagName('conditionalFormatting');
+        for (let i = 0; i < cfNodes.length; i++) {
+            const sqref = cfNodes[i].getAttribute('sqref');
+            if (sqref) {
+                cfNodes[i].setAttribute('sqref', adjustRangeRef(sqref, origDataEndRowNum, rowShift));
+            }
+        }
+
+        // Serialize back
+        const serializer = new XMLSerializer();
+        let output = serializer.serializeToString(doc);
+
+        // Clean up extra namespace declarations that XMLSerializer adds
+        output = output.replace(/\s+xmlns:ns\d+="[^"]*"/g, '');
+        output = output.replace(/ns\d+:/g, '');
+
+        return output;
     }
 
-    function updateFormulaRanges(formula, origStart, origEnd, newStart, newEnd) {
-        // Replace cell range references like H17:H45 with adjusted ranges
-        return formula.replace(
+    /**
+     * Update a cell's value in-place within the DOM
+     */
+    function updateCellValue(doc, cellEl, newValue, getOrAddSS) {
+        // Remove existing v element
+        const existingV = cellEl.getElementsByTagName('v')[0];
+
+        if (isNumeric(newValue)) {
+            cellEl.removeAttribute('t');
+            if (existingV) {
+                existingV.textContent = String(newValue);
+            } else {
+                const vEl = doc.createElementNS(XLSX_NS, 'v');
+                vEl.textContent = String(newValue);
+                cellEl.appendChild(vEl);
+            }
+        } else {
+            const ssIdx = getOrAddSS(String(newValue));
+            cellEl.setAttribute('t', 's');
+            if (existingV) {
+                existingV.textContent = String(ssIdx);
+            } else {
+                const vEl = doc.createElementNS(XLSX_NS, 'v');
+                vEl.textContent = String(ssIdx);
+                cellEl.appendChild(vEl);
+            }
+        }
+    }
+
+    /**
+     * Generic formula range updater — handles all columns, not just H
+     */
+    function updateFormulaRangesGeneric(formula, origDataStart, origDataEnd, newDataStart, newDataEnd, origFooterStart, newFooterStart) {
+        // Update cell range references like SUM(H17:H45) → SUM(H17:H30)
+        let result = formula.replace(
             /([A-Z]+)(\d+):([A-Z]+)(\d+)/g,
             (match, col1, row1, col2, row2) => {
                 const r1 = parseInt(row1);
                 const r2 = parseInt(row2);
-                // If the range falls within the original data area, adjust
-                if (r1 >= origStart && r2 <= origEnd + 20) {
-                    return `${col1}${newStart}:${col2}${newEnd}`;
+                // If range falls within or covers the original data area
+                if (r1 >= origDataStart && r1 <= origDataEnd + 20 && r2 >= origDataStart) {
+                    const newR1 = (r1 >= origFooterStart) ? newFooterStart + (r1 - origFooterStart) : r1;
+                    const newR2 = (r2 >= origFooterStart) ? newFooterStart + (r2 - origFooterStart)
+                        : (r2 <= origDataEnd) ? newDataEnd : newDataEnd;
+                    return `${col1}${newR1}:${col2}${newR2}`;
+                }
+                return match;
+            }
+        );
+
+        // Update individual cell references in footer rows
+        result = result.replace(
+            /([A-Z]+)(\d+)(?![:\d])/g,
+            (match, col, row) => {
+                const r = parseInt(row);
+                if (r >= origFooterStart) {
+                    return `${col}${newFooterStart + (r - origFooterStart)}`;
+                }
+                return match;
+            }
+        );
+
+        return result;
+    }
+
+    /**
+     * Update merge cells in the DOM — adjust for data zone changes
+     */
+    function updateMergeCells(doc, dataStart, origDataEnd, newDataEnd, origFooterStart, rowShift) {
+        const mergeCellsNode = doc.getElementsByTagName('mergeCells')[0];
+        if (!mergeCellsNode) return;
+
+        const mergeNodes = mergeCellsNode.getElementsByTagName('mergeCell');
+        const toRemove = [];
+        const toAdd = [];
+
+        for (let i = mergeNodes.length - 1; i >= 0; i--) {
+            const ref = mergeNodes[i].getAttribute('ref');
+            const match = ref.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+            if (!match) continue;
+
+            const [, col1, row1str, col2, row2str] = match;
+            const r1 = parseInt(row1str);
+            const r2 = parseInt(row2str);
+
+            if (r1 >= dataStart && r2 <= origDataEnd) {
+                // Data zone merge — remove (new data has its own structure)
+                toRemove.push(mergeNodes[i]);
+            } else if (r1 >= origFooterStart) {
+                // Footer zone merge — adjust row numbers
+                mergeNodes[i].setAttribute('ref',
+                    `${col1}${r1 + rowShift}:${col2}${r2 + rowShift}`
+                );
+            } else if (r1 < dataStart && r2 >= origFooterStart) {
+                // Cross-zone merge — adjust end row
+                mergeNodes[i].setAttribute('ref',
+                    `${col1}${r1}:${col2}${r2 + rowShift}`
+                );
+            }
+        }
+
+        toRemove.forEach(node => mergeCellsNode.removeChild(node));
+
+        // Update count
+        const remaining = mergeCellsNode.getElementsByTagName('mergeCell').length;
+        if (remaining === 0) {
+            mergeCellsNode.parentNode.removeChild(mergeCellsNode);
+        } else {
+            mergeCellsNode.setAttribute('count', String(remaining));
+        }
+    }
+
+    /**
+     * Adjust a sqref string (e.g. "A5:H50") when rows shift
+     */
+    function adjustRangeRef(sqref, origDataEnd, rowShift) {
+        return sqref.replace(
+            /([A-Z]+)(\d+):([A-Z]+)(\d+)/g,
+            (match, col1, row1, col2, row2) => {
+                const r2 = parseInt(row2);
+                if (r2 >= origDataEnd) {
+                    return `${col1}${row1}:${col2}${r2 + rowShift}`;
                 }
                 return match;
             }
         );
     }
 
-    function rebuildMergeCells(analysis, newDataCount, dataStart, dataEnd, footerStart) {
-        const merges = [];
-        const origMerges = analysis.mergeCells;
-        const origDataStart = analysis.dataZone.startRowNum;
-        const origDataEnd = analysis.dataZone.endRowNum;
-        const origFooterStart = analysis.footerZone.rows[0]?.rowNum || origDataEnd + 1;
-
-        for (const merge of origMerges) {
-            const match = merge.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
-            if (!match) continue;
-            const [, col1, row1str, col2, row2str] = match;
-            const r1 = parseInt(row1str);
-            const r2 = parseInt(row2str);
-
-            if (r1 < origDataStart) {
-                // Header zone merge — keep as-is
-                merges.push(merge);
-            } else if (r1 >= origFooterStart) {
-                // Footer zone merge — adjust row numbers
-                const offset = r1 - origFooterStart;
-                const offset2 = r2 - origFooterStart;
-                merges.push(`${col1}${footerStart + offset}:${col2}${footerStart + offset2}`);
-            }
-            // Data zone merges are not copied — new data has its own structure
-        }
-
-        return merges;
-    }
-
-    function buildFullSheetXml(origDoc, sheetDataContent, merges, lastRow, maxCol) {
-        const ns = XLSX_NS;
-
-        // Extract key elements from original
-        let sheetViewsXml = '';
-        let colsXml = '';
-        let pageMarginsXml = '';
-        let pageSetupXml = '';
-        let drawingXml = '';
-        let headerFooterXml = '';
-
-        // SheetViews
-        const svNodes = origDoc.getElementsByTagName('sheetViews');
-        if (svNodes.length > 0) {
-            sheetViewsXml = new XMLSerializer().serializeToString(svNodes[0]);
-            // Clean up namespace duplication
-            sheetViewsXml = cleanNamespaces(sheetViewsXml);
-        }
-
-        // SheetFormatPr
-        let sheetFormatPrXml = '';
-        const sfpNodes = origDoc.getElementsByTagName('sheetFormatPr');
-        if (sfpNodes.length > 0) {
-            sheetFormatPrXml = new XMLSerializer().serializeToString(sfpNodes[0]);
-            sheetFormatPrXml = cleanNamespaces(sheetFormatPrXml);
-        }
-
-        // Cols
-        const colNodes = origDoc.getElementsByTagName('cols');
-        if (colNodes.length > 0) {
-            colsXml = new XMLSerializer().serializeToString(colNodes[0]);
-            colsXml = cleanNamespaces(colsXml);
-        }
-
-        // Page margins
-        const pmNodes = origDoc.getElementsByTagName('pageMargins');
-        if (pmNodes.length > 0) {
-            pageMarginsXml = new XMLSerializer().serializeToString(pmNodes[0]);
-            pageMarginsXml = cleanNamespaces(pageMarginsXml);
-        }
-
-        // Page setup
-        const psNodes = origDoc.getElementsByTagName('pageSetup');
-        if (psNodes.length > 0) {
-            pageSetupXml = new XMLSerializer().serializeToString(psNodes[0]);
-            pageSetupXml = cleanNamespaces(pageSetupXml);
-        }
-
-        // Drawing reference
-        const drawNodes = origDoc.getElementsByTagName('drawing');
-        if (drawNodes.length > 0) {
-            drawingXml = new XMLSerializer().serializeToString(drawNodes[0]);
-            drawingXml = cleanNamespaces(drawingXml);
-        }
-
-        // Header/Footer
-        const hfNodes = origDoc.getElementsByTagName('headerFooter');
-        if (hfNodes.length > 0) {
-            headerFooterXml = new XMLSerializer().serializeToString(hfNodes[0]);
-            headerFooterXml = cleanNamespaces(headerFooterXml);
-        }
-
-        // LegacyDrawing (for comments)
-        let legacyDrawingXml = '';
-        const ldNodes = origDoc.getElementsByTagName('legacyDrawing');
-        if (ldNodes.length > 0) {
-            legacyDrawingXml = new XMLSerializer().serializeToString(ldNodes[0]);
-            legacyDrawingXml = cleanNamespaces(legacyDrawingXml);
-        }
-
-        // Merge cells XML
-        let mergeCellsXml = '';
-        if (merges.length > 0) {
-            mergeCellsXml = `<mergeCells count="${merges.length}">` +
-                merges.map(m => `<mergeCell ref="${m}"/>`).join('') +
-                `</mergeCells>`;
-        }
-
-        // Build dimension
-        const lastCol = colToRef(maxCol || 8);
-        const dimRef = `A1:${lastCol}${lastRow}`;
-
-        return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="${ns}" xmlns:r="${REL_NS}">
-<dimension ref="${dimRef}"/>
-${sheetViewsXml}
-${sheetFormatPrXml}
-${colsXml}
-<sheetData>
-${sheetDataContent}
-</sheetData>
-${mergeCellsXml}
-${pageMarginsXml}
-${pageSetupXml}
-${headerFooterXml}
-${drawingXml}
-${legacyDrawingXml}
-</worksheet>`;
-    }
-
-    function cleanNamespaces(xml) {
-        // Remove duplicate namespace declarations added by XMLSerializer
-        return xml
-            .replace(/\s+xmlns="http:\/\/schemas\.openxmlformats\.org\/spreadsheetml\/2006\/main"/g, '')
-            .replace(/\s+xmlns:r="http:\/\/schemas\.openxmlformats\.org\/officeDocument\/2006\/relationships"/g, '');
-    }
-
-    function buildSharedStringsXml(strings) {
-        const count = strings.length;
-        const items = strings.map(s => `<si><t>${escapeXml(s)}</t></si>`).join('\n');
+    /**
+     * Build shared strings XML preserving original rich text formatting
+     */
+    function buildSharedStringsXmlPreserved(rawSiElements) {
+        const count = rawSiElements.length;
+        // Clean up namespace attributes from serialized elements
+        const cleanedElements = rawSiElements.map(si => {
+            return si
+                .replace(/\s+xmlns="http:\/\/schemas\.openxmlformats\.org\/spreadsheetml\/2006\/main"/g, '')
+                .replace(/\s+xmlns:ns\d+="[^"]*"/g, '');
+        });
         return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${count}" uniqueCount="${count}">
-${items}
+${cleanedElements.join('\n')}
 </sst>`;
     }
 
@@ -753,7 +876,7 @@ ${items}
             sheetCount: templateData.sheets.length,
             sheetNames: templateData.sheetNames,
             columnHeaders: a.columnHeaderRow.headers.map(h => h.label),
-            headerRowCount: a.headerZone.rows.length + 1, // +1 for column header row
+            headerRowCount: a.headerZone.rows.length + 1,
             dataRowCount: a.dataZone.dataRows.length,
             footerRowCount: a.footerZone.rows.length,
             hasCategories: a.dataZone.categoryRows.length > 0,

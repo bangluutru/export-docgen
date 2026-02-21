@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Surgical Replace Test</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <script src="xlsx-reader.js"></script>
+    <script src="xlsx-writer.js"></script>
+    <script src="template-engine.js"></script>
+    <style>
+        body {
+            font-family: monospace;
+            max-width: 900px;
+            margin: 40px auto;
+            background: #1a1a2e;
+            color: #e0e0e0;
+        }
+
+        .pass {
+            color: #4caf50;
+        }
+
+        .fail {
+            color: #f44336;
+        }
+
+        .info {
+            color: #64b5f6;
+        }
+
+        pre {
+            background: #16213e;
+            padding: 12px;
+            border-radius: 8px;
+            overflow-x: auto;
+        }
+
+        h1 {
+            color: #e94560;
+        }
+
+        #log {
+            white-space: pre-wrap;
+        }
+
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            cursor: pointer;
+            background: #e94560;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            margin: 8px;
+        }
+
+        button:hover {
+            background: #c42b4b;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🧪 Template Engine — Surgical Replace Test</h1>
+    <button onclick="runTest()">▶ Run Test</button>
+    <button onclick="runAndDownload()">📥 Run + Download Output</button>
+    <pre id="log"></pre>
+    <script>
+        const log = document.getElementById('log');
+        function print(msg, cls = '') { log.innerHTML += `<span class="${cls}">${msg}</span>\n`; }
+
+        async function runTest() {
+            log.innerHTML = '';
+            print('=== Starting Surgical Replace Test ===', 'info');
+
+            try {
+                // 1. Load template
+                print('\n[1] Loading template_mau.xlsx...', 'info');
+                const tplResp = await fetch('template_mau.xlsx');
+                const tplBuffer = await tplResp.arrayBuffer();
+                const tplSize = tplBuffer.byteLength;
+                print(`   Template size: ${(tplSize / 1024).toFixed(1)} KB`);
+
+                // 2. Analyze template
+                print('\n[2] Analyzing template...', 'info');
+                const templateData = await TemplateEngine.analyzeTemplate(tplBuffer);
+                const summary = TemplateEngine.getTemplateSummary(templateData);
+                print(`   Sheets: ${summary.sheetNames.join(', ')}`);
+                print(`   Columns: ${summary.maxColumns}`);
+                print(`   Headers: ${summary.columnHeaders.join(', ')}`);
+                print(`   Header rows: ${summary.headerRowCount}`);
+                print(`   Data rows: ${summary.dataRowCount}`);
+                print(`   Footer rows: ${summary.footerRowCount}`);
+                print(`   Merge cells: ${summary.mergeCount}`);
+                print(`   ✓ Template analysis OK`, 'pass');
+
+                // 3. Check analysis details
+                print('\n[3] Checking analysis zones...', 'info');
+                const a = templateData.analysis;
+                print(`   Header zone: rows 1–${a.headerZone.endRow}`);
+                print(`   Column header: row ${a.columnHeaderRow.rowNum}`);
+                print(`   Data zone: rows ${a.dataZone.startRowNum}–${a.dataZone.endRowNum}`);
+                print(`   Footer zone: ${a.footerZone.rows.length} rows starting at row ${a.footerZone.rows[0]?.rowNum || 'N/A'}`);
+                print(`   Style patterns: ${a.dataZone.stylePatterns.length}`);
+                print(`   Category rows: ${a.dataZone.categoryRows.length}`);
+
+                if (a.dataZone.stylePatterns.length > 0) {
+                    print(`   First pattern styles: ${a.dataZone.stylePatterns[0].pattern.map(p => `Col${p.col}:s${p.style}`).join(', ')}`);
+                }
+                print(`   ✓ Zone detection OK`, 'pass');
+
+                // 4. Check shared strings preserved
+                print('\n[4] Checking shared strings preservation...', 'info');
+                const rawCount = templateData.rawSiElements?.length || 0;
+                const strCount = templateData.sharedStrings?.length || 0;
+                print(`   Shared strings: ${strCount}`);
+                print(`   Raw SI elements: ${rawCount}`);
+                const hasRichText = templateData.rawSiElements?.some(si => si.includes('<r>') || si.includes('<r '));
+                print(`   Has rich text: ${hasRichText ? 'YES' : 'NO'}`);
+                if (rawCount === strCount) {
+                    print(`   ✓ Shared string count matches`, 'pass');
+                } else {
+                    print(`   ✗ Count mismatch!`, 'fail');
+                }
+
+                // 5. Check styles parsed
+                print('\n[5] Checking styles.xml parsing...', 'info');
+                const styles = templateData.stylesData;
+                if (styles) {
+                    print(`   Fonts: ${styles.fonts.length}`);
+                    print(`   Fills: ${styles.fills.length}`);
+                    print(`   Borders: ${styles.borders.length}`);
+                    print(`   Cell XFs: ${styles.cellXfs.length}`);
+                    print(`   Number formats: ${Object.keys(styles.numFmts).length}`);
+                    if (styles.fonts.length > 0) {
+                        const f0 = styles.fonts[0];
+                        print(`   Font[0]: ${f0.name || 'unnamed'} ${f0.size || '?'}pt${f0.bold ? ' bold' : ''}`);
+                    }
+                    print(`   ✓ Styles parsed OK`, 'pass');
+                } else {
+                    print(`   ✗ No styles data!`, 'fail');
+                }
+
+                // 6. Load test data
+                print('\n[6] Loading test_data.xlsx...', 'info');
+                const dataResp = await fetch('test_data.xlsx');
+                const dataBuffer = await dataResp.arrayBuffer();
+                const workbook = await XLSXReader.read(dataBuffer);
+                const sheet = workbook.sheets[workbook.sheetNames[0]];
+                print(`   Rows: ${sheet.rows.length}, Cols: ${sheet.headers.length}`);
+                print(`   Headers: ${sheet.headers.join(', ')}`);
+                print(`   ✓ Data loaded OK`, 'pass');
+
+                // 7. Generate output with template
+                print('\n[7] Generating Excel from template...', 'info');
+                const t0 = performance.now();
+
+                // Map data to template columns (simple: use as-is for this test)
+                const mappedRows = sheet.rows;
+
+                const blob = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: mappedRows,
+                    sheetName: workbook.sheetNames[0],
+                });
+                const t1 = performance.now();
+
+                const outputSize = blob.size;
+                print(`   Output size: ${(outputSize / 1024).toFixed(1)} KB`);
+                print(`   Template size: ${(tplSize / 1024).toFixed(1)} KB`);
+                print(`   Ratio: ${(outputSize / tplSize * 100).toFixed(0)}%`);
+                print(`   Time: ${(t1 - t0).toFixed(0)} ms`);
+
+                // 8. Verify output structure
+                print('\n[8] Verifying output XLSX structure...', 'info');
+                const outputZip = await JSZip.loadAsync(blob);
+                const files = Object.keys(outputZip.files);
+                print(`   Files in ZIP: ${files.length}`);
+
+                const requiredFiles = [
+                    'xl/workbook.xml',
+                    'xl/sharedStrings.xml',
+                    'xl/styles.xml',
+                    '[Content_Types].xml',
+                ];
+                let allPresent = true;
+                for (const f of requiredFiles) {
+                    const found = files.some(name => name === f);
+                    if (!found) {
+                        print(`   ✗ Missing: ${f}`, 'fail');
+                        allPresent = false;
+                    } else {
+                        print(`   ✓ ${f}`, 'pass');
+                    }
+                }
+
+                // Check sheet file exists (must be .xml, not directory entry)
+                const sheetFile = files.find(f => f.includes('worksheets/') && f.endsWith('.xml'));
+                if (sheetFile) {
+                    print(`   ✓ ${sheetFile}`, 'pass');
+                } else {
+                    print(`   ✗ No worksheet file!`, 'fail');
+                    allPresent = false;
+                }
+
+                // 9. Check output sheet XML content
+                print('\n[9] Checking output sheet XML...', 'info');
+                if (sheetFile) {
+                    const sheetXml = await outputZip.file(sheetFile).async('string');
+                    const sheetDoc = new DOMParser().parseFromString(sheetXml, 'application/xml');
+
+                    // Check preserved elements
+                    const checks = [
+                        ['sheetViews', 'Sheet views'],
+                        ['sheetFormatPr', 'Sheet format'],
+                        ['cols', 'Column definitions'],
+                        ['sheetData', 'Sheet data'],
+                        ['pageMargins', 'Page margins'],
+                        ['pageSetup', 'Page setup'],
+                    ];
+                    for (const [tag, label] of checks) {
+                        const nodes = sheetDoc.getElementsByTagName(tag);
+                        if (nodes.length > 0) {
+                            print(`   ✓ ${label} preserved (${tag})`, 'pass');
+                        } else {
+                            print(`   ✗ ${label} missing (${tag})`, 'fail');
+                        }
+                    }
+
+                    // Optional elements
+                    const optChecks = [
+                        ['conditionalFormatting', 'Conditional formatting'],
+                        ['dataValidations', 'Data validations'],
+                        ['autoFilter', 'Auto filter'],
+                        ['drawing', 'Drawing/images'],
+                        ['headerFooter', 'Header/Footer'],
+                        ['mergeCells', 'Merge cells'],
+                    ];
+                    for (const [tag, label] of optChecks) {
+                        const nodes = sheetDoc.getElementsByTagName(tag);
+                        if (nodes.length > 0) {
+                            print(`   ✓ ${label} preserved (${tag})`, 'pass');
+                        } else {
+                            print(`   · ${label} not in template (${tag})`, 'info');
+                        }
+                    }
+
+                    // Count rows
+                    const rows = sheetDoc.getElementsByTagName('row');
+                    print(`\n   Total rows in output: ${rows.length}`);
+                    // Show row numbers
+                    const rowNums = [];
+                    for (let i = 0; i < rows.length; i++) {
+                        rowNums.push(rows[i].getAttribute('r'));
+                    }
+                    print(`   Row numbers: ${rowNums.join(', ')}`);
+
+                    // Check dimension
+                    const dim = sheetDoc.getElementsByTagName('dimension')[0];
+                    if (dim) {
+                        print(`   Dimension: ${dim.getAttribute('ref')}`);
+                    }
+                }
+
+                // 10. Check shared strings in output
+                print('\n[10] Checking output shared strings...', 'info');
+                const ssXml = await outputZip.file('xl/sharedStrings.xml').async('string');
+                const ssDoc = new DOMParser().parseFromString(ssXml, 'application/xml');
+                const siNodes = ssDoc.getElementsByTagName('si');
+                print(`   Shared strings in output: ${siNodes.length}`);
+
+                // Check for rich text preservation
+                let richTextCount = 0;
+                for (let i = 0; i < siNodes.length; i++) {
+                    const rNodes = siNodes[i].getElementsByTagName('r');
+                    if (rNodes.length > 0) richTextCount++;
+                }
+                print(`   Rich text entries: ${richTextCount}`);
+
+                // 11. Check styles preserved
+                print('\n[11] Checking output styles...', 'info');
+                const stylesXml = await outputZip.file('xl/styles.xml').async('string');
+                const stylesDoc = new DOMParser().parseFromString(stylesXml, 'application/xml');
+                const xfCount = stylesDoc.getElementsByTagName('xf').length;
+                const fontCountOut = stylesDoc.getElementsByTagName('font').length;
+                print(`   Fonts in output: ${fontCountOut}`);
+                print(`   XFs in output: ${xfCount}`);
+                if (xfCount === styles.cellXfs.length * 2 + 1 || xfCount >= styles.cellXfs.length) {
+                    print(`   ✓ Styles preserved`, 'pass');
+                }
+
+                print('\n=== ALL TESTS COMPLETE ===', 'pass');
+                return blob;
+
+            } catch (err) {
+                print(`\n✗ ERROR: ${err.message}`, 'fail');
+                print(err.stack, 'fail');
+                return null;
+            }
+        }
+
+        async function runAndDownload() {
+            const blob = await runTest();
+            if (blob) {
+                saveAs(blob, 'test_output.xlsx');
+                print('\n📥 File downloaded as test_output.xlsx', 'info');
+            }
+        }
+    </script>
+</body>
+
+</html>
