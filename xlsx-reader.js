@@ -156,21 +156,76 @@ const XLSXReader = (function () {
         }
 
         // Convert to arrays
-        // First row = headers
+        // Smart header detection: find the actual column header row
+        // (not just the first row, which may be a template title/header zone)
         const rowNums = Object.keys(rawRows).map(Number).sort((a, b) => a - b);
         if (rowNums.length === 0) {
             return { headers: ['Cột 1'], rows: [] };
         }
 
-        const firstRowNum = rowNums[0];
+        // Look for a row that looks like column headers:
+        // - Has 3+ non-empty cells
+        // - All values are short text (< 30 chars)
+        // - Contains a marker like "No.", "STT", "#", "番号"
+        let headerRowIdx = 0; // default: first row
+        const headerMarkers = ['no.', 'no', 'stt', '#', '番号', 'number', 'số'];
+
+        for (let idx = 0; idx < rowNums.length && idx < 30; idx++) {
+            const rn = rowNums[idx];
+            const rowData = rawRows[rn];
+            if (!rowData) continue;
+
+            const values = [];
+            for (let c = 1; c <= maxCol; c++) {
+                values.push(String(rowData[c] || ''));
+            }
+
+            const nonEmpty = values.filter(v => v.trim().length > 0);
+            const allShort = values.every(v => v.length < 30);
+            const hasMarker = values.some(v =>
+                headerMarkers.includes(v.toLowerCase().trim())
+            );
+
+            if (nonEmpty.length >= 3 && allShort && hasMarker) {
+                headerRowIdx = idx;
+                break;
+            }
+        }
+
+        const headerRowNum = rowNums[headerRowIdx];
         const headers = [];
         for (let c = 1; c <= maxCol; c++) {
-            const val = rawRows[firstRowNum] ? (rawRows[firstRowNum][c] || '') : '';
+            const val = rawRows[headerRowNum] ? (rawRows[headerRowNum][c] || '') : '';
             headers.push(val || `Cột ${c}`);
         }
 
+        // Data rows start AFTER the header row
+        // Also skip any immediately following sub-header rows (e.g., a second language header row)
+        let dataStartIdx = headerRowIdx + 1;
+
+        // Check if the next row is also a header-like row (e.g., English translation of Japanese headers)
+        if (dataStartIdx < rowNums.length) {
+            const nextRn = rowNums[dataStartIdx];
+            const nextRow = rawRows[nextRn];
+            if (nextRow) {
+                const nextValues = [];
+                for (let c = 1; c <= maxCol; c++) {
+                    nextValues.push(String(nextRow[c] || ''));
+                }
+                const nonEmpty = nextValues.filter(v => v.trim().length > 0);
+                const allText = nextValues.every(v => {
+                    const cleaned = v.replace(/[,.\s]/g, '');
+                    return cleaned === '' || isNaN(cleaned);
+                });
+                // If the next row is also all-text with 3+ cells, it's likely a sub-header
+                if (nonEmpty.length >= 3 && allText) {
+                    dataStartIdx++;
+                }
+            }
+        }
+
         const rows = [];
-        for (let ri = 1; ri < rowNums.length; ri++) {
+        for (let ri = dataStartIdx; ri < rowNums.length; ri++) {
             const rn = rowNums[ri];
             const row = [];
             for (let c = 1; c <= maxCol; c++) {
