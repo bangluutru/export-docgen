@@ -374,16 +374,41 @@
         });
     }
 
+    // Cross-language synonym groups for auto-mapping
+    // Each group contains terms that refer to the same concept across languages
+    const SYNONYM_GROUPS = [
+        ['no.', 'no', '#', 'stt', '番号', '番', 'number', 'số'],
+        ['品名', '品目', 'product name', 'product', 'item', 'item name', 'tên sản phẩm', 'tên hàng', 'sản phẩm', 'name'],
+        ['包装', 'package', 'packaging', 'pack', 'gói', 'đóng gói', 'bao bì'],
+        ['数量', 'quantity', 'qty', 'số lượng', 'sl'],
+        ['容量', 'unit', 'volume', 'capacity', 'đơn vị', 'dung tích'],
+        ['単価', 'unit price', 'price', 'đơn giá', 'giá'],
+        ['金額', 'amount', 'total', 'thành tiền', 'tổng', 'tổng tiền', 'tiền'],
+    ];
+
     function stringSimilarity(a, b) {
         if (a === b) return 1;
         if (!a || !b) return 0;
+
+        const la = a.toLowerCase().trim();
+        const lb = b.toLowerCase().trim();
+        if (la === lb) return 1;
+
+        // Check cross-language synonyms
+        for (const group of SYNONYM_GROUPS) {
+            const aInGroup = group.some(syn => syn === la || la.includes(syn) || syn.includes(la));
+            const bInGroup = group.some(syn => syn === lb || lb.includes(syn) || syn.includes(lb));
+            if (aInGroup && bInGroup) return 0.9;
+        }
+
         // Check containment
-        if (a.includes(b) || b.includes(a)) return 0.8;
-        // Simple Jaccard on trigrams
+        if (la.includes(lb) || lb.includes(la)) return 0.8;
+
+        // Simple Jaccard on bigrams
         const triA = new Set();
         const triB = new Set();
-        for (let i = 0; i <= a.length - 2; i++) triA.add(a.substring(i, i + 2));
-        for (let i = 0; i <= b.length - 2; i++) triB.add(b.substring(i, i + 2));
+        for (let i = 0; i <= la.length - 2; i++) triA.add(la.substring(i, i + 2));
+        for (let i = 0; i <= lb.length - 2; i++) triB.add(lb.substring(i, i + 2));
         let inter = 0;
         triA.forEach(t => { if (triB.has(t)) inter++; });
         return inter / (triA.size + triB.size - inter);
