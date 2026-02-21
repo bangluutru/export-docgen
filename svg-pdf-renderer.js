@@ -147,53 +147,13 @@ const SVGPDFRenderer = (() => {
         const PX_PER_MM = 3.78; // 96 dpi
         const contentWidthPX = Math.round(contentWidthMM * PX_PER_MM);
 
-        // Content-aware column width calculation
-        // Scan data cells to determine optimal width per column based on content.
-        // Ignore general header/footer rows because they often contain long text (like company addresses)
-        // in column A without colspans, which distorts the width of the "No." column.
-        const colMaxChars = {};
-        for (let c = 1; c <= maxCol; c++) colMaxChars[c] = 3; // minimum 3 chars
-
-        const rowsToScan = [...newDataRows];
-        // Ensure we include the template's column headers (usually the last row before dataStart)
-        if (headerRows.length > 0) {
-            rowsToScan.push(headerRows[headerRows.length - 1]);
-        }
-
-        for (const row of rowsToScan) {
-            for (const cell of row.cells) {
-                const text = cell.display || '';
-                // Estimate char width: CJK chars ≈ 1.8 units, ASCII ≈ 1 unit
-                let charWidth = 0;
-                for (const ch of text) {
-                    charWidth += ch.charCodeAt(0) > 0x7F ? 1.8 : 1;
-                }
-
-                // For merged cells, don't count — the width spans multiple columns
-                const mergeKey = `${row.rowNum},${cell.colNum}`;
-                const merge = mergeMap[mergeKey];
-                if ((merge && merge.isOrigin && merge.colspan > 1) || (merge && !merge.isOrigin)) continue;
-
-                if (charWidth > colMaxChars[cell.colNum]) {
-                    colMaxChars[cell.colNum] = Math.min(charWidth, 40); // cap at 40 chars
-                }
-            }
-        }
-
-        // Also factor in Excel column widths as a baseline
-        let totalWeight = 0;
-        const colWeights = {};
-        for (let c = 1; c <= maxCol; c++) {
-            const contentW = colMaxChars[c] * 7; // ~7px per char at 10px font
-            const excelW = (colWidths[c] || 8.43) * 7; // Excel width units to px
-            // Blend: 70% content-based, 30% Excel-based
-            colWeights[c] = Math.max(contentW * 0.7 + excelW * 0.3, 25);
-            totalWeight += colWeights[c];
-        }
-
+        // Use 100% Excel template column widths — the template designer set these proportions.
+        // Header text uses overflow:visible so it doesn't need wider columns.
+        let totalExcelW = 0;
+        for (let c = 1; c <= maxCol; c++) totalExcelW += (colWidths[c] || 8.43);
         const colPxWidths = {};
         for (let c = 1; c <= maxCol; c++) {
-            colPxWidths[c] = Math.round((colWeights[c] / totalWeight) * contentWidthPX);
+            colPxWidths[c] = Math.round(((colWidths[c] || 8.43) / totalExcelW) * contentWidthPX);
         }
 
         // 10. Build HTML table
