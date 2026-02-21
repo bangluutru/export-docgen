@@ -306,7 +306,8 @@
     function buildColumnMapping() {
         if (!templateData || !workbookData) return;
 
-        const tplHeaders = templateSummary.columnHeaders.filter(h => h.trim().length > 0);
+        // Use ALL template columns (including empty headers) to preserve column positions
+        const allTplHeaders = templateSummary.columnHeaders;
         const selectedSheet = sheetSelect.value || workbookData.sheetNames[0];
         const dataSheet = workbookData.sheets[selectedSheet];
         if (!dataSheet) return;
@@ -317,13 +318,21 @@
         columnMapping = {};
         const mappingRows = [];
 
-        tplHeaders.forEach((tplHeader, tplIdx) => {
+        allTplHeaders.forEach((tplHeader, tplIdx) => {
+            const headerText = String(tplHeader).trim();
+
+            if (headerText.length === 0) {
+                // Empty template header — no mapping available
+                columnMapping[tplIdx] = -1;
+                return; // Skip UI row for empty headers
+            }
+
             // Try to find a matching data column
             let bestMatch = -1;
             let bestScore = 0;
 
             dataHeaders.forEach((dh, di) => {
-                const score = stringSimilarity(tplHeader.toLowerCase(), String(dh).toLowerCase());
+                const score = stringSimilarity(headerText.toLowerCase(), String(dh).toLowerCase());
                 if (score > bestScore) {
                     bestScore = score;
                     bestMatch = di;
@@ -341,7 +350,7 @@
             mappingRows.push(`
                 <div class="mapping-row">
                     <div class="mapping-template-col">
-                        <span class="col-tag">${tplHeader}</span>
+                        <span class="col-tag">${headerText}</span>
                     </div>
                     <div class="mapping-arrow">→</div>
                     <div class="mapping-data-col">
@@ -463,12 +472,13 @@
     function mapDataToTemplate(sheet) {
         if (!columnMapping || !templateSummary) return sheet.rows;
 
-        const tplHeaders = templateSummary.columnHeaders.filter(h => h.trim().length > 0);
+        // Use ALL template columns (including empty headers) to preserve column positions
+        const allTplHeaders = templateSummary.columnHeaders;
         const mappedRows = [];
 
         for (const row of sheet.rows) {
             const mappedRow = [];
-            tplHeaders.forEach((_, tplIdx) => {
+            allTplHeaders.forEach((_, tplIdx) => {
                 const dataIdx = columnMapping[tplIdx];
                 if (dataIdx >= 0 && dataIdx < row.length) {
                     mappedRow.push(row[dataIdx]);
@@ -508,7 +518,7 @@
             const title = $('reportTitle')?.value || selectedSheet;
 
             const headers = templateData && columnMapping
-                ? templateSummary.columnHeaders.filter(h => h.trim().length > 0)
+                ? templateSummary.columnHeaders
                 : sheet.headers;
 
             const rows = templateData && columnMapping
