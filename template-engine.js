@@ -373,13 +373,37 @@ const TemplateEngine = (() => {
         // Footer zone
         const footerZoneRows = rows.slice(dataEndIdx + 1);
 
-        // Column headers
-        const columnHeaders = headerRow.cells.map(c => ({
-            col: c.col,
-            ref: c.ref,
-            label: c.displayValue,
-            style: c.s,
-        }));
+        // Column headers — build for ALL columns (1 to maxCol), filling merge gaps
+        // Merge cells (e.g. C15:D15) cause the merged column (D) to have no <c> element,
+        // so we must fill the gap to ensure columnHeaders.length === maxCol
+        const headerCellMap = {};
+        for (const c of headerRow.cells) {
+            headerCellMap[c.col] = c;
+        }
+        const computedMaxCol = Math.max(
+            ...headerRow.cells.map(c => c.col),
+            ...rows.slice(dataStartIdx, Math.min(dataStartIdx + 5, rows.length)).flatMap(r => r.cells.map(c => c.col))
+        );
+        const columnHeaders = [];
+        for (let col = 1; col <= computedMaxCol; col++) {
+            const cell = headerCellMap[col];
+            if (cell) {
+                columnHeaders.push({
+                    col: cell.col,
+                    ref: cell.ref,
+                    label: cell.displayValue,
+                    style: cell.s,
+                });
+            } else {
+                // This column is part of a merge or has no header cell — insert empty placeholder
+                columnHeaders.push({
+                    col: col,
+                    ref: colToRef(col) + headerRow.rowNum,
+                    label: '',
+                    style: '0',
+                });
+            }
+        }
 
         // Style patterns for data rows
         const dataStylePatterns = [];
@@ -415,7 +439,7 @@ const TemplateEngine = (() => {
             });
         }
 
-        const maxCol = Math.max(...headerRow.cells.map(c => c.col));
+        const maxCol = computedMaxCol;
 
         return {
             headerZone: {
@@ -536,7 +560,7 @@ const TemplateEngine = (() => {
         const stylePatterns = dataZone.stylePatterns;
         if (stylePatterns.length === 0) return origXml;
 
-        const colCount = columnHeaderRow.headers.length;
+        const colCount = maxCol; // Use maxCol, NOT headers.length (merge cells cause gaps)
         const dataStartRowNum = dataZone.startRowNum;
         const origDataEndRowNum = dataZone.endRowNum;
         const origFooterStartRowNum = footerZone.rows[0]?.rowNum || origDataEndRowNum + 1;
