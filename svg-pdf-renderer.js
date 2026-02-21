@@ -1,16 +1,15 @@
 /**
- * HTML-PDF Renderer — Cell-perfect PDF from Excel template.
+ * PDF Renderer — Breakthrough approach: Excel → HTML Table → html2canvas → PDF
  * 
- * Approach: Parse template XML cell-by-cell, map styles to rendering params, 
- * then draw directly with jsPDF (vector, no html2canvas raster).
- * 
- * This avoids the html2canvas blank-page issue and produces small vector PDFs.
+ * Strategy: Build a complete HTML table from the template XML with ALL merge cells,
+ * styles, column widths, and row heights. Render it VISIBLE in the viewport
+ * (behind loading overlay) so html2canvas can capture it. Then place the
+ * captured canvas image into jsPDF pages.
+ *
+ * This leverages the browser's native text rendering engine for perfect layout.
  */
 const SVGPDFRenderer = (() => {
     'use strict';
-
-    const PT_TO_MM = 0.3528; // 1pt = 0.3528mm
-    const EXCEL_COL_TO_MM = 2.3; // 1 Excel col width unit ≈ 2.3mm
 
     const PAGE_SIZES = {
         a4: { w: 210, h: 297 },
@@ -24,9 +23,8 @@ const SVGPDFRenderer = (() => {
         '5B9BD5', '70AD47',
     ];
 
-    /**
-     * Main entry point
-     */
+    // ===== Main entry =====
+
     async function renderToPDF(opts) {
         const {
             headers, rows,
@@ -43,265 +41,363 @@ const SVGPDFRenderer = (() => {
         return await renderSimpleTable(headers, rows, title, pageSize, landscape, margins);
     }
 
-    /**
-     * Cell-perfect rendering from template
-     */
+    // ===== Template-based rendering =====
+
     async function renderFromTemplate(templateData, dataRows, pageSize, landscape, margins) {
         const zip = templateData.zip;
         const analysis = templateData.analysis;
 
-        // 1. Parse template sheet XML
+        // 1. Parse template XML
         const sheetXml = await zip.file(templateData.sheetPaths[0]).async('string');
         const sheetDoc = new DOMParser().parseFromString(sheetXml, 'application/xml');
 
-        // 2. Parse shared strings
+        // 2. Shared strings
         const ssFile = zip.file('xl/sharedStrings.xml');
         const ssXml = ssFile ? await ssFile.async('string') : '<sst/>';
         const strings = parseStrings(ssXml);
 
-        // 3. Parse styles
+        // 3. Styles
         const stylesXml = await zip.file('xl/styles.xml').async('string');
         const styles = parseStyles(stylesXml);
 
-        // 4. Parse columns
+        // 4. Column widths
         const colWidths = parseColumnWidths(sheetDoc);
 
-        // 5. Parse merge cells
+        // 5. Merge cells from template
         const merges = parseMergeCells(sheetDoc);
 
-        // 6. Parse all rows from template
-        const allTemplateRows = parseAllRows(sheetDoc, strings);
+        // 6. All template rows
+        const allRows = parseAllRows(sheetDoc, strings);
 
-        // 7. Determine zones
+        // 7. Zone detection
         const dataStart = analysis.dataZone.startRowNum;
         const dataEnd = analysis.dataZone.endRowNum;
-        const headerRows = allTemplateRows.filter(r => r.rowNum < dataStart);
-        const tplDataRows = allTemplateRows.filter(r => r.rowNum >= dataStart && r.rowNum <= dataEnd);
-        const footerRows = allTemplateRows.filter(r => r.rowNum > dataEnd);
+        const maxCol = analysis.maxCol || 8;
 
-        // 8. Style patterns from template data rows
+        // 8. Build final rows: header zone + new data + shifted footer
+        const headerRows = allRows.filter(r => r.rowNum < dataStart);
+        const tplDataRows = allRows.filter(r => r.rowNum >= dataStart && r.rowNum <= dataEnd);
+        const footerRows = allRows.filter(r => r.rowNum > dataEnd);
+
+        // Style patterns
         const stylePatterns = tplDataRows.map(tr => ({
-            styles: tr.cells.map(c => c.s),
+            cellStyles: {},
             ht: tr.ht,
         }));
+        for (const tr of tplDataRows) {
+            const pi = tplDataRows.indexOf(tr);
+            for (const cell of tr.cells) {
+                stylePatterns[pi].cellStyles[cell.colNum] = cell.s;
+            }
+        }
 
-        // 9. Max columns
-        const maxCol = Math.max(8, ...allTemplateRows.flatMap(r => r.cells.map(c => c.colNum)));
-
-        // 10. Build new data rows
+        // New data rows
         const newDataRows = [];
         for (let ri = 0; ri < dataRows.length; ri++) {
             const rowData = dataRows[ri];
             const rowNum = dataStart + ri;
             const patIdx = ri % Math.max(1, stylePatterns.length);
-            const pattern = stylePatterns[patIdx] || stylePatterns[0];
+            const pat = stylePatterns[patIdx] || stylePatterns[0];
 
             const cells = [];
             for (let ci = 0; ci < Math.min(rowData.length, maxCol); ci++) {
                 cells.push({
                     colNum: ci + 1,
-                    s: pattern?.styles[ci] || 0,
+                    s: pat?.cellStyles[ci + 1] || 0,
                     display: String(rowData[ci] ?? ''),
                     t: '',
                 });
             }
-            newDataRows.push({ rowNum, ht: pattern?.ht || 18, cells });
+            newDataRows.push({ rowNum, ht: pat?.ht || 18, cells });
         }
 
-        // 11. Shift footer rows
+        // Shift footer
         const shift = newDataRows.length - (dataEnd - dataStart + 1);
-        const shiftedFooter = footerRows.map(r => ({ ...r, rowNum: r.rowNum + shift }));
+        const shiftedFooter = footerRows.map(r => ({
+            ...r,
+            rowNum: r.rowNum + shift,
+            cells: r.cells.map(c => ({ ...c })),
+        }));
 
-        // 12. Adjust merges (remove data zone merges, shift footer merges)
+        // Adjust merges
         const adjustedMerges = [];
         for (const m of merges) {
-            if (m.startRow >= dataStart && m.endRow <= dataEnd) continue; // data zone
+            if (m.startRow >= dataStart && m.endRow <= dataEnd) continue;
             if (m.startRow > dataEnd) {
-                adjustedMerges.push({ ...m, startRow: m.startRow + shift, endRow: m.endRow + shift });
+                adjustedMerges.push({
+                    ...m,
+                    startRow: m.startRow + shift,
+                    endRow: m.endRow + shift,
+                });
             } else {
                 adjustedMerges.push(m);
             }
         }
 
-        // 13. Combine all rows
         const allFinalRows = [...headerRows, ...newDataRows, ...shiftedFooter];
+        allFinalRows.sort((a, b) => a.rowNum - b.rowNum);
 
-        // 14. Calculate page layout
+        // Build merge map
+        const mergeMap = buildMergeMap(adjustedMerges);
+
+        // 9. Calculate page dimensions (in pixels for HTML)
+        const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
+        const pw = landscape ? pgBase.h : pgBase.w; // mm
+        const contentWidthMM = pw - margins.left - margins.right;
+        const PX_PER_MM = 3.78; // 96 dpi
+        const contentWidthPX = Math.round(contentWidthMM * PX_PER_MM);
+
+        // Scale column widths to fit page width
+        let totalExcelW = 0;
+        for (let c = 1; c <= maxCol; c++) totalExcelW += (colWidths[c] || 8.43);
+        const colPxWidths = {};
+        for (let c = 1; c <= maxCol; c++) {
+            colPxWidths[c] = Math.round(((colWidths[c] || 8.43) / totalExcelW) * contentWidthPX);
+        }
+
+        // 10. Build HTML table
+        const html = buildFullHTML(allFinalRows, mergeMap, styles, maxCol, colPxWidths, contentWidthPX);
+
+        // 11. Render HTML → Canvas → PDF
+        return await htmlCanvasToPDF(html, pageSize, landscape, margins, contentWidthPX);
+    }
+
+    // ===== Build HTML table =====
+
+    function buildFullHTML(rows, mergeMap, styles, maxCol, colPxWidths, totalWidth) {
+        let html = `<table style="border-collapse:collapse; width:${totalWidth}px; table-layout:fixed; font-family:'MS PGothic','Yu Gothic','Meiryo',sans-serif; font-size:10px;">`;
+
+        // Colgroup for fixed widths
+        html += '<colgroup>';
+        for (let c = 1; c <= maxCol; c++) {
+            html += `<col style="width:${colPxWidths[c]}px">`;
+        }
+        html += '</colgroup>';
+
+        for (const row of rows) {
+            const cellMap = {};
+            for (const cell of row.cells) cellMap[cell.colNum] = cell;
+
+            const rowH = Math.max(Math.round((row.ht || 16) * 1.15), 14);
+            html += `<tr style="height:${rowH}px">`;
+
+            for (let c = 1; c <= maxCol; c++) {
+                const key = `${row.rowNum},${c}`;
+                const merge = mergeMap[key];
+
+                if (merge && !merge.isOrigin) continue; // covered by merge
+
+                let colspan = '';
+                let rowspan = '';
+                let cellW = colPxWidths[c];
+                if (merge && merge.isOrigin) {
+                    if (merge.colspan > 1) {
+                        colspan = ` colspan="${merge.colspan}"`;
+                        cellW = 0;
+                        for (let mc = merge.startCol; mc <= merge.endCol; mc++) {
+                            cellW += (colPxWidths[mc] || 40);
+                        }
+                    }
+                    if (merge.rowspan > 1) rowspan = ` rowspan="${merge.rowspan}"`;
+                }
+
+                const cell = cellMap[c];
+                const css = buildCellCSS(cell, styles);
+                let content = '';
+
+                if (cell && cell.display) {
+                    // Format numbers
+                    const xf = styles.xfs[cell.s] || {};
+                    const numFmtId = xf.numFmtId || 0;
+                    if (numFmtId > 0 && cell.t !== 's' && !isNaN(parseFloat(cell.display))) {
+                        content = formatNumber(cell.display, numFmtId, styles.numFmts);
+                    } else {
+                        content = cell.display;
+                    }
+                }
+
+                html += `<td${colspan}${rowspan} style="${css}">${escapeHtml(content)}</td>`;
+            }
+            html += '</tr>';
+        }
+
+        html += '</table>';
+        return html;
+    }
+
+    function buildCellCSS(cell, styles) {
+        let css = 'padding:1px 3px; overflow:hidden; white-space:nowrap; vertical-align:middle;';
+        if (!cell) return css + 'border:0.5px solid #ccc;';
+
+        const xf = styles.xfs[cell.s] || {};
+        const font = styles.fonts[xf.fontId] || {};
+        const fill = styles.fills[xf.fillId] || {};
+        const border = styles.borders[xf.borderId] || {};
+        const align = xf.alignment || {};
+
+        // Font
+        const fontSize = Math.min(font.size || 10, 14);
+        css += `font-size:${fontSize}px;`;
+        if (font.bold) css += 'font-weight:bold;';
+
+        const fontColor = resolveColor(font.colorRgb, font.colorTheme);
+        if (fontColor && fontColor !== 'FFFFFF') css += `color:#${fontColor};`;
+
+        // Fill
+        const bg = resolveFillColor(fill);
+        if (bg) css += `background-color:#${bg};`;
+
+        // Alignment
+        if (align.horizontal === 'center') css += 'text-align:center;';
+        else if (align.horizontal === 'right') css += 'text-align:right;';
+        else if (cell.display && !isNaN(parseFloat(cell.display)) && cell.t !== 's') css += 'text-align:right;';
+
+        if (align.vertical === 'center') css += 'vertical-align:middle;';
+        else if (align.vertical === 'top') css += 'vertical-align:top;';
+
+        // Borders
+        css += borderSideCSS('top', border.top);
+        css += borderSideCSS('bottom', border.bottom);
+        css += borderSideCSS('left', border.left);
+        css += borderSideCSS('right', border.right);
+
+        // Default thin border if no borders specified
+        if (!border.top && !border.bottom && !border.left && !border.right) {
+            css += 'border:0.5px solid #ddd;';
+        }
+
+        return css;
+    }
+
+    function borderSideCSS(side, b) {
+        if (!b || !b.style) return '';
+        const widths = { thin: '1px', medium: '2px', thick: '3px', hair: '0.5px' };
+        const w = widths[b.style] || '1px';
+        let color = '#000';
+        if (b.color) {
+            const resolved = b.color.length === 8 ? b.color.substring(2) : b.color;
+            color = '#' + resolved;
+        }
+        return `border-${side}:${w} solid ${color};`;
+    }
+
+    // ===== HTML → Canvas → PDF =====
+
+    async function htmlCanvasToPDF(html, pageSize, landscape, margins) {
         const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
         const pw = landscape ? pgBase.h : pgBase.w;
         const ph = landscape ? pgBase.w : pgBase.h;
         const contentW = pw - margins.left - margins.right;
+        const contentH = ph - margins.top - margins.bottom;
+        const PX_PER_MM = 3.78;
+        const contentWpx = Math.round(contentW * PX_PER_MM);
 
-        // Scale column widths to fit page
-        let totalExcelW = 0;
-        for (let c = 1; c <= maxCol; c++) totalExcelW += (colWidths[c] || 8.43);
-        const scaledWidths = {};
-        for (let c = 1; c <= maxCol; c++) {
-            scaledWidths[c] = ((colWidths[c] || 8.43) / totalExcelW) * contentW;
+        // Create visible container (behind loading overlay)
+        const container = document.createElement('div');
+        container.style.cssText = `
+            position: fixed; left: 0; top: 0; z-index: 9998;
+            width: ${contentWpx}px; background: white; padding: 0;
+            font-family: 'MS PGothic', 'Yu Gothic', 'Meiryo', sans-serif;
+        `;
+        container.innerHTML = html;
+        document.body.appendChild(container);
+
+        // Wait for layout
+        await new Promise(r => setTimeout(r, 100));
+
+        try {
+            // Capture with html2canvas
+            const canvas = await html2canvas(container, {
+                scale: 2, // high quality
+                useCORS: true,
+                logging: false,
+                backgroundColor: '#ffffff',
+                width: contentWpx,
+                windowWidth: contentWpx,
+            });
+
+            // Calculate pages
+            const imgW = canvas.width;
+            const imgH = canvas.height;
+            const pageContentHpx = Math.round(contentH * PX_PER_MM * 2); // scale=2
+            const totalPages = Math.ceil(imgH / pageContentHpx);
+
+            const jsPDFLib = window.jspdf || window.jsPDF;
+            const doc = new jsPDFLib.jsPDF({
+                orientation: landscape ? 'landscape' : 'portrait',
+                unit: 'mm', format: pageSize, compress: true,
+            });
+
+            for (let page = 0; page < totalPages; page++) {
+                if (page > 0) doc.addPage();
+
+                // Slice the canvas for this page
+                const srcY = page * pageContentHpx;
+                const srcH = Math.min(pageContentHpx, imgH - srcY);
+                if (srcH <= 0) break;
+
+                const pageCanvas = document.createElement('canvas');
+                pageCanvas.width = imgW;
+                pageCanvas.height = srcH;
+                const ctx = pageCanvas.getContext('2d');
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, imgW, srcH);
+                ctx.drawImage(canvas, 0, srcY, imgW, srcH, 0, 0, imgW, srcH);
+
+                const imgData = pageCanvas.toDataURL('image/jpeg', 0.92);
+                const sliceHmm = (srcH / (PX_PER_MM * 2));
+
+                doc.addImage(imgData, 'JPEG', margins.left, margins.top, contentW, sliceHmm);
+
+                // Page number
+                doc.setFontSize(8);
+                doc.setTextColor(150, 150, 150);
+                doc.text(`${page + 1} / ${totalPages}`, pw / 2, ph - 3, { align: 'center' });
+                doc.setTextColor(0, 0, 0);
+            }
+
+            return doc.output('blob');
+        } finally {
+            document.body.removeChild(container);
         }
+    }
 
-        // 15. Build merge map
-        const mergeMap = buildMergeMap(adjustedMerges);
+    // ===== Simple table (no template) =====
 
-        // 16. Create jsPDF and draw
+    async function renderSimpleTable(headers, rows, title, pageSize, landscape, margins) {
         const jsPDFLib = window.jspdf || window.jsPDF;
+        const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
+        const pw = landscape ? pgBase.h : pgBase.w;
+        const ph = landscape ? pgBase.w : pgBase.h;
+
         const doc = new jsPDFLib.jsPDF({
             orientation: landscape ? 'landscape' : 'portrait',
             unit: 'mm', format: pageSize, compress: true,
         });
 
-        // Load Unicode font
         let fontName = 'helvetica';
         if (typeof FontLoader !== 'undefined') {
             await FontLoader.registerFont(doc);
             if (FontLoader.isLoaded()) fontName = 'NotoSans';
         }
 
-        // Draw rows page by page
-        let y = margins.top;
-        let pageNum = 1;
-
-        for (const row of allFinalRows) {
-            const rowH = Math.max(row.ht * PT_TO_MM, 4);
-
-            // Check page break
-            if (y + rowH > ph - margins.bottom - 5) {
-                // Page number
-                drawPageNumber(doc, pageNum, pw, ph, fontName);
-                doc.addPage();
-                pageNum++;
-                y = margins.top;
-            }
-
-            // Draw cells for this row
-            drawRow(doc, row, scaledWidths, mergeMap, styles, maxCol, margins.left, y, rowH, fontName);
-            y += rowH;
+        if (title) {
+            doc.setFont(fontName, 'bold');
+            doc.setFontSize(16);
+            doc.text(title, pw / 2, 15, { align: 'center' });
         }
 
-        // Last page number
-        drawPageNumber(doc, pageNum, pw, ph, fontName);
+        doc.autoTable({
+            head: [headers],
+            body: rows,
+            startY: title ? 25 : 10,
+            styles: { font: fontName, fontSize: 9, cellPadding: 3 },
+            headStyles: { fillColor: [99, 102, 241], textColor: 255, fontStyle: 'bold', halign: 'center' },
+            alternateRowStyles: { fillColor: [245, 245, 255] },
+            margin: { top: 10, right: 10, bottom: 10, left: 10 },
+        });
 
         return doc.output('blob');
-    }
-
-    /**
-     * Draw a single row
-     */
-    function drawRow(doc, row, colWidths, mergeMap, styles, maxCol, x, y, h, fontName) {
-        const cellMap = {};
-        for (const cell of row.cells) cellMap[cell.colNum] = cell;
-
-        let cellX = x;
-        for (let c = 1; c <= maxCol; c++) {
-            const w = colWidths[c] || 10;
-            const mergeKey = `${row.rowNum},${c}`;
-            const merge = mergeMap[mergeKey];
-
-            if (merge && !merge.isOrigin) {
-                cellX += w;
-                continue; // Covered by merge
-            }
-
-            // Calculate actual width/height considering merge
-            let actualW = w;
-            let actualH = h;
-            if (merge && merge.isOrigin) {
-                actualW = 0;
-                for (let mc = merge.startCol; mc <= merge.endCol; mc++) {
-                    actualW += (colWidths[mc] || 10);
-                }
-                // For rowspan, we'd need to know subsequent row heights — use approximate
-                if (merge.rowspan > 1) {
-                    actualH = h * merge.rowspan;
-                }
-            }
-
-            const cell = cellMap[c];
-            const xf = cell ? (styles.xfs[cell.s] || {}) : {};
-            const font = styles.fonts[xf.fontId] || {};
-            const fill = styles.fills[xf.fillId] || {};
-            const border = styles.borders[xf.borderId] || {};
-            const align = xf.alignment || {};
-
-            // Fill color
-            const bgColor = resolveFillColor(fill);
-            if (bgColor) {
-                const rgb = hexToRgb(bgColor);
-                doc.setFillColor(rgb[0], rgb[1], rgb[2]);
-                doc.rect(cellX, y, actualW, actualH, 'F');
-            }
-
-            // Borders
-            drawBorders(doc, border, cellX, y, actualW, actualH);
-
-            // Text
-            if (cell && cell.display && cell.display.trim() !== '') {
-                const fontSize = Math.min(font.size || 10, 13);
-                const isBold = font.bold;
-                doc.setFont(fontName, isBold ? 'bold' : 'normal');
-                doc.setFontSize(fontSize);
-
-                const fontColor = resolveFontColor(font);
-                if (fontColor) {
-                    const rgb = hexToRgb(fontColor);
-                    doc.setTextColor(rgb[0], rgb[1], rgb[2]);
-                } else {
-                    doc.setTextColor(0, 0, 0);
-                }
-
-                // Format number
-                let text = cell.display;
-                const numFmtId = xf.numFmtId || 0;
-                if (numFmtId > 0 && cell.t !== 's') {
-                    text = formatNumber(text, numFmtId, styles.numFmts);
-                }
-
-                // Truncate to fit
-                text = truncateText(doc, text, actualW - 2);
-
-                // Alignment
-                const hAlign = align.horizontal || (isNumericStr(text) ? 'right' : 'left');
-                let tx = cellX + 1;
-                if (hAlign === 'center') tx = cellX + actualW / 2;
-                else if (hAlign === 'right') tx = cellX + actualW - 1;
-
-                const ty = y + actualH / 2 + fontSize * 0.12;
-                doc.text(text, tx, ty, { align: hAlign, baseline: 'middle' });
-
-                doc.setTextColor(0, 0, 0); // Reset
-            }
-
-            cellX += w;
-        }
-    }
-
-    function drawBorders(doc, border, x, y, w, h) {
-        if (!border) return;
-        const sides = [
-            { name: 'top', x1: x, y1: y, x2: x + w, y2: y },
-            { name: 'bottom', x1: x, y1: y + h, x2: x + w, y2: y + h },
-            { name: 'left', x1: x, y1: y, x2: x, y2: y + h },
-            { name: 'right', x1: x + w, y1: y, x2: x + w, y2: y + h },
-        ];
-        for (const side of sides) {
-            const b = border[side.name];
-            if (b && b.style) {
-                const lw = b.style === 'thin' ? 0.2 : b.style === 'medium' ? 0.5 : 0.1;
-                doc.setLineWidth(lw);
-                const color = b.color || '000000';
-                const rgb = hexToRgb(color.replace(/^FF/, ''));
-                doc.setDrawColor(rgb[0], rgb[1], rgb[2]);
-                doc.line(side.x1, side.y1, side.x2, side.y2);
-            }
-        }
-    }
-
-    function drawPageNumber(doc, num, pw, ph, fontName) {
-        doc.setFont(fontName, 'normal');
-        doc.setFontSize(8);
-        doc.setTextColor(150, 150, 150);
-        doc.text(`${num}`, pw / 2, ph - 5, { align: 'center' });
-        doc.setTextColor(0, 0, 0);
     }
 
     // ===== Parsers =====
@@ -379,16 +475,17 @@ const SVGPDFRenderer = (() => {
         const doc = new DOMParser().parseFromString(stylesXml, 'application/xml');
 
         // Fonts
-        const fontNodes = doc.getElementsByTagName('fonts')[0]?.querySelectorAll(':scope > font') || [];
+        const fontParent = doc.getElementsByTagName('fonts')[0];
+        const fontNodes = fontParent ? fontParent.querySelectorAll(':scope > font') : [];
         const fonts = [];
         for (const f of fontNodes) {
-            const nameEl = f.getElementsByTagName('name')[0];
-            const szEl = f.getElementsByTagName('sz')[0];
+            const nm = f.getElementsByTagName('name')[0];
+            const sz = f.getElementsByTagName('sz')[0];
             const bNodes = f.getElementsByTagName('b');
             const colorEl = f.getElementsByTagName('color')[0];
             fonts.push({
-                name: nameEl?.getAttribute('val') || 'serif',
-                size: parseFloat(szEl?.getAttribute('val') || '11'),
+                name: nm?.getAttribute('val') || 'sans-serif',
+                size: parseFloat(sz?.getAttribute('val') || '11'),
                 bold: bNodes.length > 0,
                 colorRgb: colorEl?.getAttribute('rgb') || null,
                 colorTheme: colorEl?.getAttribute('theme') || null,
@@ -396,7 +493,8 @@ const SVGPDFRenderer = (() => {
         }
 
         // Fills
-        const fillNodes = doc.getElementsByTagName('fills')[0]?.querySelectorAll(':scope > fill') || [];
+        const fillParent = doc.getElementsByTagName('fills')[0];
+        const fillNodes = fillParent ? fillParent.querySelectorAll(':scope > fill') : [];
         const fills = [];
         for (const f of fillNodes) {
             const pf = f.getElementsByTagName('patternFill')[0];
@@ -410,17 +508,18 @@ const SVGPDFRenderer = (() => {
         }
 
         // Borders
-        const borderNodes = doc.getElementsByTagName('borders')[0]?.querySelectorAll(':scope > border') || [];
+        const borderParent = doc.getElementsByTagName('borders')[0];
+        const borderNodes = borderParent ? borderParent.querySelectorAll(':scope > border') : [];
         const borders = [];
         for (const b of borderNodes) {
             const sides = {};
             for (const side of ['left', 'right', 'top', 'bottom']) {
                 const el = b.getElementsByTagName(side)[0];
                 if (el && el.getAttribute('style')) {
-                    const colorEl = el.getElementsByTagName('color')[0];
+                    const cEl = el.getElementsByTagName('color')[0];
                     sides[side] = {
                         style: el.getAttribute('style'),
-                        color: colorEl?.getAttribute('rgb') || (colorEl?.getAttribute('auto') === 'true' ? '000000' : null),
+                        color: cEl?.getAttribute('rgb') || (cEl?.getAttribute('auto') === 'true' ? '000000' : '000000'),
                     };
                 }
             }
@@ -428,7 +527,8 @@ const SVGPDFRenderer = (() => {
         }
 
         // CellXfs
-        const xfNodes = doc.getElementsByTagName('cellXfs')[0]?.querySelectorAll(':scope > xf') || [];
+        const xfParent = doc.getElementsByTagName('cellXfs')[0];
+        const xfNodes = xfParent ? xfParent.querySelectorAll(':scope > xf') : [];
         const xfs = [];
         for (const xf of xfNodes) {
             const al = xf.getElementsByTagName('alignment')[0];
@@ -440,6 +540,7 @@ const SVGPDFRenderer = (() => {
                 alignment: al ? {
                     horizontal: al.getAttribute('horizontal') || null,
                     vertical: al.getAttribute('vertical') || null,
+                    wrapText: al.getAttribute('wrapText') === '1',
                 } : null,
             });
         }
@@ -470,84 +571,7 @@ const SVGPDFRenderer = (() => {
         return map;
     }
 
-    // ===== Simple table (no template) =====
-
-    async function renderSimpleTable(headers, rows, title, pageSize, landscape, margins) {
-        const jsPDFLib = window.jspdf || window.jsPDF;
-        const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
-        const pw = landscape ? pgBase.h : pgBase.w;
-        const ph = landscape ? pgBase.w : pgBase.h;
-        const contentW = pw - margins.left - margins.right;
-
-        const doc = new jsPDFLib.jsPDF({
-            orientation: landscape ? 'landscape' : 'portrait',
-            unit: 'mm', format: pageSize, compress: true,
-        });
-
-        let fontName = 'helvetica';
-        if (typeof FontLoader !== 'undefined') {
-            await FontLoader.registerFont(doc);
-            if (FontLoader.isLoaded()) fontName = 'NotoSans';
-        }
-
-        let y = margins.top;
-
-        // Title
-        if (title) {
-            doc.setFont(fontName, 'bold');
-            doc.setFontSize(16);
-            doc.text(title, pw / 2, y + 6, { align: 'center' });
-            y += 12;
-        }
-
-        // Column widths proportional
-        const colW = contentW / headers.length;
-
-        // Headers
-        doc.setFillColor(68, 114, 196);
-        doc.rect(margins.left, y, contentW, 7, 'F');
-        doc.setFont(fontName, 'bold');
-        doc.setFontSize(9);
-        doc.setTextColor(255, 255, 255);
-        for (let i = 0; i < headers.length; i++) {
-            const x = margins.left + i * colW;
-            doc.text(truncateText(doc, String(headers[i]), colW - 2), x + colW / 2, y + 4.5, { align: 'center' });
-        }
-        y += 7;
-        doc.setTextColor(0, 0, 0);
-
-        // Rows
-        for (let ri = 0; ri < rows.length; ri++) {
-            if (y + 6 > ph - margins.bottom - 5) {
-                doc.addPage();
-                y = margins.top;
-            }
-
-            if (ri % 2 === 1) {
-                doc.setFillColor(242, 242, 242);
-                doc.rect(margins.left, y, contentW, 6, 'F');
-            }
-
-            doc.setFont(fontName, 'normal');
-            doc.setFontSize(8);
-            doc.setDrawColor(200, 200, 200);
-            doc.setLineWidth(0.1);
-            doc.rect(margins.left, y, contentW, 6, 'S');
-
-            for (let ci = 0; ci < headers.length; ci++) {
-                const x = margins.left + ci * colW;
-                const val = String(rows[ri]?.[ci] ?? '');
-                const align = isNumericStr(val) ? 'right' : 'left';
-                const tx = align === 'right' ? x + colW - 1 : x + 1;
-                doc.text(truncateText(doc, val, colW - 2), tx, y + 3.8, { align });
-            }
-            y += 6;
-        }
-
-        return doc.output('blob');
-    }
-
-    // ===== Utility =====
+    // ===== Utilities =====
 
     function parseCellRef(ref) {
         const match = ref.match(/^([A-Z]+)(\d+)$/);
@@ -567,59 +591,28 @@ const SVGPDFRenderer = (() => {
         return null;
     }
 
-    function resolveFontColor(font) {
-        return resolveColor(font.colorRgb, font.colorTheme);
-    }
-
     function resolveFillColor(fill) {
         if (!fill || fill.pattern === 'none' || fill.pattern === 'gray125') return null;
         return resolveColor(fill.fgRgb, fill.fgTheme);
     }
 
-    function hexToRgb(hex) {
-        if (!hex) return [0, 0, 0];
-        hex = hex.replace('#', '');
-        return [
-            parseInt(hex.substring(0, 2), 16) || 0,
-            parseInt(hex.substring(2, 4), 16) || 0,
-            parseInt(hex.substring(4, 6), 16) || 0,
-        ];
-    }
-
     function formatNumber(val, numFmtId, numFmts) {
         const num = parseFloat(val);
         if (isNaN(num)) return val;
-        if (numFmtId === 38 || numFmtId === 39 || numFmtId === 40 || numFmtId === 3 || numFmtId === 4) {
-            return num.toLocaleString('ja-JP');
-        }
+        if ([3, 4, 38, 39, 40].includes(numFmtId)) return num.toLocaleString('ja-JP');
         const fmt = numFmts[numFmtId];
-        if (fmt && fmt.includes('#,##0')) {
-            return num.toLocaleString('ja-JP');
-        }
+        if (fmt && fmt.includes('#,##0')) return num.toLocaleString('ja-JP');
         if ((numFmtId >= 14 && numFmtId <= 22) || (fmt && (fmt.includes('yy') || fmt.includes('dd')))) {
-            const epoch = new Date(1899, 11, 30);
-            const date = new Date(epoch.getTime() + num * 86400000);
+            const date = new Date(Date.UTC(1899, 11, 30) + num * 86400000);
             return date.toLocaleDateString('ja-JP');
         }
-        if (numFmtId === 49) return val; // text
+        if (numFmtId === 49) return val;
         return val;
     }
 
-    function truncateText(doc, text, maxW) {
-        if (!text || maxW <= 0) return '';
-        if (doc.getTextWidth(text) <= maxW) return text;
-        let lo = 0, hi = text.length;
-        while (lo < hi - 1) {
-            const mid = (lo + hi) >> 1;
-            if (doc.getTextWidth(text.substring(0, mid) + '…') <= maxW) lo = mid;
-            else hi = mid;
-        }
-        return text.substring(0, lo) + '…';
-    }
-
-    function isNumericStr(s) {
-        if (!s) return false;
-        return !isNaN(String(s).replace(/[,\s¥$€]/g, ''));
+    function escapeHtml(str) {
+        if (!str) return '';
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
     return { renderToPDF };
