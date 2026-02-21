@@ -222,24 +222,62 @@ const SVGPDFRenderer = (() => {
             const rowH = Math.max(Math.round((row.ht || 16) * 1.15), 14);
             html += `<tr style="height:${rowH}px">`;
 
+            let skipUntilCol = 0;
+
             for (let c = 1; c <= maxCol; c++) {
+                if (c <= skipUntilCol) continue;
+
                 const key = `${row.rowNum},${c}`;
                 const merge = mergeMap[key];
 
-                if (merge && !merge.isOrigin) continue; // covered by merge
+                if (merge && !merge.isOrigin) continue; // covered by explicit merge
 
-                let colspan = '';
-                let rowspan = '';
+                let colspanAttr = 1;
+                let rowspanAttr = 1;
                 let cellW = colPxWidths[c];
+
                 if (merge && merge.isOrigin) {
-                    if (merge.colspan > 1) {
-                        colspan = ` colspan="${merge.colspan}"`;
-                        cellW = 0;
-                        for (let mc = merge.startCol; mc <= merge.endCol; mc++) {
-                            cellW += (colPxWidths[mc] || 40);
+                    colspanAttr = merge.colspan || 1;
+                    rowspanAttr = merge.rowspan || 1;
+                    cellW = 0;
+                    for (let mc = merge.startCol; mc <= merge.endCol; mc++) {
+                        cellW += (colPxWidths[mc] || 40);
+                    }
+                } else {
+                    // Breakthrough Auto-Colspan: If this cell has text, and adjacent cells are empty,
+                    // absorb them so the text has room to breathe, mirroring Excel's visual overflow.
+                    const cell = cellMap[c];
+                    if (cell && cell.display && String(cell.display).trim().length > 0) {
+                        for (let nc = c + 1; nc <= maxCol; nc++) {
+                            const nextKey = `${row.rowNum},${nc}`;
+                            const nextMerge = mergeMap[nextKey];
+                            const nextCell = cellMap[nc];
+
+                            // Stop if hitting an explicit merge
+                            if (nextMerge) break;
+
+                            // Stop if next cell has its own text
+                            if (nextCell && nextCell.display && String(nextCell.display).trim().length > 0) break;
+
+                            // Stop if next cell has a distinct background color (don't erase visual blocks)
+                            let hasDistinctFill = false;
+                            if (nextCell && nextCell.s) {
+                                const nxf = styles.xfs[nextCell.s] || {};
+                                const nfill = styles.fills[nxf.fillId] || {};
+                                if (nfill.pattern && nfill.pattern !== 'none' && nfill.pattern !== 'gray125') {
+                                    hasDistinctFill = true;
+                                }
+                            }
+                            if (hasDistinctFill) break;
+
+                            // Safe to absorb this empty column!
+                            colspanAttr++;
                         }
                     }
-                    if (merge.rowspan > 1) rowspan = ` rowspan="${merge.rowspan}"`;
+                }
+
+                if (colspanAttr > 1 && !(merge && merge.isOrigin)) {
+                    skipUntilCol = c + colspanAttr - 1;
                 }
 
                 const cell = cellMap[c];
@@ -257,7 +295,9 @@ const SVGPDFRenderer = (() => {
                     }
                 }
 
-                html += `<td${colspan}${rowspan} style="${css}">${escapeHtml(content)}</td>`;
+                const colspanStr = colspanAttr > 1 ? ` colspan="${colspanAttr}"` : '';
+                const rowspanStr = rowspanAttr > 1 ? ` rowspan="${rowspanAttr}"` : '';
+                html += `<td${colspanStr}${rowspanStr} style="${css}">${escapeHtml(content)}</td>`;
             }
             html += '</tr>';
         }
