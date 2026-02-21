@@ -501,7 +501,7 @@
             return;
         }
 
-        showLoading('Đang tạo PDF...');
+        showLoading('Đang tải font Unicode...');
         try {
             const pgSize = $('pageSize').value;
             const isLandscape = $('landscape').checked;
@@ -521,9 +521,16 @@
                 format: pgSize,
             });
 
+            // Register Noto Sans JP Unicode font (lazy-loaded on first use)
+            if (typeof FontLoader !== 'undefined') {
+                await FontLoader.registerFont(doc);
+                showLoading('Đang tạo PDF...');
+            }
+
             // Title
+            const fontName = (typeof FontLoader !== 'undefined' && FontLoader.isLoaded()) ? 'NotoSansJP' : 'helvetica';
             doc.setFontSize(16);
-            doc.setFont('helvetica', 'bold');
+            doc.setFont(fontName, 'bold');
             const pageWidth = doc.internal.pageSize.getWidth();
             doc.text(title, pageWidth / 2, 15, { align: 'center' });
 
@@ -533,6 +540,7 @@
                 body: rows,
                 startY: 25,
                 styles: {
+                    font: fontName,
                     fontSize: 9,
                     cellPadding: 3,
                 },

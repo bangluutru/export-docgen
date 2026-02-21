@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Font files (downloaded separately - see setup.sh)
+*.ttf
+
 # OS files
 .DS_Store
 Thumbs.db
