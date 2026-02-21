@@ -33,7 +33,21 @@ const FontLoader = (() => {
                     try {
                         const resp = await fetch(url);
                         if (resp.ok) {
+                            // Validate that we got a real font file, not HTML (SPA fallback)
+                            const contentType = resp.headers.get('content-type') || '';
+                            if (contentType.includes('text/html')) {
+                                console.warn(`[FontLoader] ${url} returned HTML (not a font), skipping`);
+                                continue;
+                            }
                             buffer = await resp.arrayBuffer();
+                            // Extra check: valid TTF/OTF starts with specific magic bytes
+                            const header = new Uint8Array(buffer.slice(0, 4));
+                            const magic = String.fromCharCode(...header);
+                            if (buffer.byteLength < 1000 || (magic !== '\x00\x01\x00\x00' && magic !== 'OTTO' && magic !== 'true' && magic !== 'typ1')) {
+                                console.warn(`[FontLoader] ${url} is not a valid font file (${buffer.byteLength} bytes), skipping`);
+                                buffer = null;
+                                continue;
+                            }
                             console.log(`[FontLoader] Loaded font from: ${url} (${(buffer.byteLength / 1024).toFixed(0)} KB)`);
                             break;
                         }
