@@ -197,7 +197,7 @@ const SVGPDFRenderer = (() => {
         }
 
         // 10. Build HTML table
-        const html = buildFullHTML(allFinalRows, mergeMap, styles, maxCol, colPxWidths, contentWidthPX);
+        const html = buildFullHTML(allFinalRows, mergeMap, styles, maxCol, colPxWidths, contentWidthPX, dataStart);
 
         // 11. Render HTML → Canvas → PDF
         return await htmlCanvasToPDF(html, pageSize, landscape, margins, contentWidthPX);
@@ -205,7 +205,7 @@ const SVGPDFRenderer = (() => {
 
     // ===== Build HTML table =====
 
-    function buildFullHTML(rows, mergeMap, styles, maxCol, colPxWidths, totalWidth) {
+    function buildFullHTML(rows, mergeMap, styles, maxCol, colPxWidths, totalWidth, dataStartRowNum) {
         let html = `<table style="border-collapse:collapse; width:${totalWidth}px; table-layout:fixed; font-family:'MS PGothic','Yu Gothic','Meiryo',sans-serif; font-size:10px;">`;
 
         // Colgroup for fixed widths
@@ -281,7 +281,10 @@ const SVGPDFRenderer = (() => {
                 }
 
                 const cell = cellMap[c];
-                const css = buildCellCSS(cell, styles);
+                // Header zone rows: use overflow:visible so long text spills into adjacent empty cells,
+                // exactly like Excel's visual overflow behavior. Data zone keeps overflow:hidden.
+                const isHeaderZone = dataStartRowNum && row.rowNum < dataStartRowNum;
+                const css = buildCellCSS(cell, styles, isHeaderZone);
                 let content = '';
 
                 if (cell && cell.display) {
@@ -306,8 +309,11 @@ const SVGPDFRenderer = (() => {
         return html;
     }
 
-    function buildCellCSS(cell, styles) {
-        let css = 'padding:1px 3px; overflow:hidden; white-space:nowrap; vertical-align:middle;';
+    function buildCellCSS(cell, styles, isHeaderZone) {
+        // Header zone: overflow:visible so text flows into adjacent empty cells (like Excel)
+        // Data zone: overflow:hidden to keep rows clean
+        const overflow = isHeaderZone ? 'overflow:visible; white-space:nowrap;' : 'overflow:hidden; white-space:nowrap;';
+        let css = `padding:1px 3px; ${overflow} vertical-align:middle;`;
         if (!cell) return css;
 
         const xf = styles.xfs[cell.s] || {};
