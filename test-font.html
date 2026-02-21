@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Font Test — Noto Sans JP</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #111;
+            color: #eee;
+            padding: 30px;
+        }
+
+        .pass {
+            color: #4caf50;
+        }
+
+        .fail {
+            color: #f44336;
+        }
+
+        .info {
+            color: #90caf9;
+        }
+
+        #log {
+            white-space: pre-wrap;
+            font-family: monospace;
+            line-height: 1.8;
+            font-size: 14px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🔤 Font Test — Noto Sans JP + jsPDF</h1>
+    <div id="log">Running tests...\n</div>
+
+    <!-- Load the same scripts as index.html -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+    <script src="font-loader.js"></script>
+
+    <script>
+        (async function () {
+            const log = document.getElementById('log');
+            function print(msg, cls) {
+                const span = document.createElement('span');
+                span.className = cls || '';
+                span.textContent = msg + '\n';
+                log.appendChild(span);
+            }
+
+            let passed = 0, failed = 0;
+
+            function assert(label, condition) {
+                if (condition) {
+                    print(`✅ PASS: ${label}`, 'pass');
+                    passed++;
+                } else {
+                    print(`❌ FAIL: ${label}`, 'fail');
+                    failed++;
+                }
+            }
+
+            // Test 1: FontLoader exists
+            assert('FontLoader is defined', typeof FontLoader !== 'undefined');
+
+            // Test 2: Load and register font with jsPDF
+            try {
+                const jsPDFLib = window.jspdf || window.jsPDF;
+                assert('jsPDF library loaded', !!jsPDFLib);
+
+                const doc = new jsPDFLib.jsPDF();
+                print('⏳ Loading Noto Sans JP font...', 'info');
+
+                const t0 = performance.now();
+                await FontLoader.registerFont(doc);
+                const loadTime = (performance.now() - t0).toFixed(0);
+                print(`⏱️ Font loaded in ${loadTime}ms`, 'info');
+
+                assert('Font registered successfully', true);
+                assert('FontLoader.isLoaded() returns true', FontLoader.isLoaded());
+
+                // Test 3: Write text in multiple languages
+                doc.setFont('NotoSansJP', 'bold');
+                doc.setFontSize(18);
+                doc.text('Font Test — Unicode Support', 20, 20);
+
+                doc.setFont('NotoSansJP', 'normal');
+                doc.setFontSize(14);
+                doc.text('日本語テスト: 品名、容量、金額', 20, 40);
+                doc.text('カタカナ: アイウエオ', 20, 55);
+                doc.text('漢字: 東京都千代田区', 20, 70);
+                doc.text('Tiếng Việt: ăắđơưứ ễệ ổỗ', 20, 85);
+                doc.text('English: Hello World 123', 20, 100);
+                assert('Text rendering (no errors thrown)', true);
+
+                // Test 4: autoTable with Unicode
+                doc.autoTable({
+                    head: [['STT', '品名 / Tên SP', '容量 / Dung lượng', '金額 / Giá']],
+                    body: [
+                        ['1', 'コーヒー', '250ml', '¥150'],
+                        ['2', 'Cà phê sữa đá', '330ml', '₫35,000'],
+                        ['3', '緑茶', '500ml', '¥120'],
+                    ],
+                    startY: 115,
+                    styles: { font: 'NotoSansJP', fontSize: 10 },
+                    headStyles: { fillColor: [99, 102, 241], fontStyle: 'bold' },
+                });
+                assert('autoTable with Unicode data', true);
+
+                // Test 5: Generate PDF blob
+                const pdfBlob = doc.output('blob');
+                assert('PDF blob generated', pdfBlob.size > 1000);
+                print(`📄 PDF size: ${(pdfBlob.size / 1024).toFixed(1)} KB`, 'info');
+
+                // Save for manual verification
+                doc.save('font-test-unicode.pdf');
+                assert('PDF saved as font-test-unicode.pdf', true);
+
+            } catch (err) {
+                print(`❌ ERROR: ${err.message}`, 'fail');
+                print(`Stack: ${err.stack}`, 'fail');
+                failed++;
+            }
+
+            // Summary
+            print('');
+            print(`═══════════════════════════════════`, '');
+            const total = passed + failed;
+            if (failed === 0) {
+                print(`🎉 ALL ${total} TESTS PASSED!`, 'pass');
+            } else {
+                print(`⚠️ ${passed}/${total} passed, ${failed} failed`, 'fail');
+            }
+            document.title = failed === 0 ? `✅ All ${total} tests passed` : `❌ ${failed} failed`;
+        })();
+    </script>
+</body>
+
+</html>

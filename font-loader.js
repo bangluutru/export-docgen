@@ -13,7 +13,7 @@ const FontLoader = (() => {
     // CDN fallback URL for the font
     const FONT_URLS = [
         'NotoSansJP-Regular.ttf',  // local
-        'https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-jp@latest/japanese-400-normal.woff2',
+        'https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-jp@latest/japanese-400-normal.ttf',
     ];
 
     /**
