@@ -113,17 +113,11 @@ const SVGPDFRenderer = (() => {
         const shiftedFooter = footerRows.map(r => ({
             ...r,
             rowNum: r.rowNum + shift,
-            cells: r.cells.map(c => {
-                const copy = { ...c };
-                // Clear cached formula values (numeric cells) in footer.
-                // These are stale results from the template's original data.
-                // Labels like 小計/税金 are shared strings (t='s') and are preserved.
-                if (copy.t !== 's' && copy.display && !isNaN(parseFloat(copy.display))) {
-                    copy.display = '';
-                }
-                return copy;
-            }),
+            cells: r.cells.map(c => ({ ...c })),
         }));
+
+        // Evaluate footer formulas — compute SUM/tax/total values from new data
+        evaluateFooterFormulas(shiftedFooter, newDataRows, dataStart, maxCol);
 
         // Adjust merges
         const adjustedMerges = [];
@@ -355,14 +349,12 @@ const SVGPDFRenderer = (() => {
 
     function borderSideCSS(side, b) {
         if (!b || !b.style) return '';
-        const widths = { thin: '0.5px', medium: '1.5px', thick: '2px', hair: '0.5px' };
+        const widths = { thin: '0.5px', medium: '1.5px', thick: '2.5px', hair: '0.5px' };
         const w = widths[b.style] || '0.5px';
-        // Use subtle gray borders for aesthetics
-        let color = '#aaa';
-        if (b.style === 'medium' || b.style === 'thick') color = '#666';
+        // Use black borders to match Excel template appearance
+        let color = '#000';
         if (b.color) {
             const resolved = b.color.length === 8 ? b.color.substring(2) : b.color;
-            // Only use explicit color if it's not auto-black
             if (resolved !== '000000' && resolved !== 'FF000000') {
                 color = '#' + resolved;
             }
@@ -599,14 +591,131 @@ const SVGPDFRenderer = (() => {
                 const s = parseInt(c.getAttribute('s') || '0');
                 const t = c.getAttribute('t') || '';
                 const vEl = c.getElementsByTagName('v')[0];
+                const fEl = c.getElementsByTagName('f')[0];
                 let val = vEl ? vEl.textContent : '';
                 let display = val;
                 if (t === 's') display = strings[parseInt(val)] || '';
-                cells.push({ colNum, s, t, display });
+                const formula = fEl ? fEl.textContent : '';
+                cells.push({ colNum, s, t, display, formula });
             }
             rows.push({ rowNum: rn, ht, cells });
         }
         return rows;
+    }
+
+    /**
+     * Evaluate footer formulas against new data rows.
+     * Handles common Excel patterns: SUM(range), CELL*constant, SUM(CELL:CELL)
+     * This allows the PDF to show computed values matching the Excel output.
+     */
+    function evaluateFooterFormulas(footerRows, dataRows, dataStart, maxCol) {
+        // Build a cell value map for resolved footer cells (for cross-references)
+        const cellValues = {}; // key: "COL_ROW" e.g. "H44" -> numeric value
+
+        // Build column sums from data rows
+        const colSums = {};
+        for (let ci = 0; ci < maxCol; ci++) {
+            let sum = 0;
+            for (const row of dataRows) {
+                const cell = row.cells.find(c => c.colNum === ci + 1);
+                if (cell) {
+                    const num = parseFloat(cell.display);
+                    if (!isNaN(num)) sum += num;
+                }
+            }
+            colSums[ci + 1] = sum;
+        }
+
+        // Helper: column number to letter(s)
+        const colToLetter = (col) => {
+            let s = '';
+            while (col > 0) { col--; s = String.fromCharCode(65 + (col % 26)) + s; col = Math.floor(col / 26); }
+            return s;
+        };
+
+        // Helper: resolve a cell ref like "H44" to its numeric value
+        const resolveRef = (ref) => {
+            const val = cellValues[ref.toUpperCase()];
+            return val !== undefined ? val : 0;
+        };
+
+        // Helper: evaluate a simple formula
+        const evalFormula = (formula, rowNum, colNum) => {
+            if (!formula) return null;
+            const f = formula.trim();
+
+            // Pattern 1: SUM(range) or SUM(range1,range2,...)
+            const sumMatch = f.match(/^SUM\((.+)\)$/i);
+            if (sumMatch) {
+                const parts = sumMatch[1].split(',');
+                let total = 0;
+                for (const part of parts) {
+                    const rangeMatch = part.trim().match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i);
+                    if (rangeMatch) {
+                        const col = rangeMatch[1].toUpperCase();
+                        const r1 = parseInt(rangeMatch[2]);
+                        const r2 = parseInt(rangeMatch[4]);
+                        for (let r = r1; r <= r2; r++) {
+                            const key = `${col}${r}`;
+                            // Check data rows first
+                            const dataRowIdx = r - dataStart;
+                            if (dataRowIdx >= 0 && dataRowIdx < dataRows.length) {
+                                const colIdx = col.charCodeAt(0) - 65; // simple A-Z
+                                const cell = dataRows[dataRowIdx].cells.find(c => c.colNum === colIdx + 1);
+                                if (cell) {
+                                    const num = parseFloat(cell.display);
+                                    if (!isNaN(num)) total += num;
+                                }
+                            } else {
+                                // Footer cell reference
+                                total += resolveRef(key);
+                            }
+                        }
+                    } else {
+                        // Single cell reference in SUM, e.g. SUM(H44)
+                        total += resolveRef(part.trim());
+                    }
+                }
+                return total;
+            }
+
+            // Pattern 2: CELL*constant (e.g. H44*0.1)
+            const mulMatch = f.match(/^([A-Z]+)(\d+)\*([\d.]+)$/i);
+            if (mulMatch) {
+                const ref = `${mulMatch[1].toUpperCase()}${mulMatch[2]}`;
+                const multiplier = parseFloat(mulMatch[3]);
+                return resolveRef(ref) * multiplier;
+            }
+
+            // Pattern 3: constant*CELL (e.g. 0.1*H44)
+            const mulMatch2 = f.match(/^([\d.]+)\*([A-Z]+)(\d+)$/i);
+            if (mulMatch2) {
+                const multiplier = parseFloat(mulMatch2[1]);
+                const ref = `${mulMatch2[2].toUpperCase()}${mulMatch2[3]}`;
+                return multiplier * resolveRef(ref);
+            }
+
+            return null; // Unrecognized formula
+        };
+
+        // Process footer rows in order (so references resolve correctly)
+        for (const row of footerRows) {
+            for (const cell of row.cells) {
+                if (!cell.formula) continue;
+
+                const result = evalFormula(cell.formula, row.rowNum, cell.colNum);
+                if (result !== null && result !== 0) {
+                    cell.display = String(result);
+                    cell.t = ''; // Mark as numeric for formatting
+                    // Register in cell value map for cross-references
+                    const colLetter = colToLetter(cell.colNum);
+                    cellValues[`${colLetter}${row.rowNum}`] = result;
+                } else if (cell.t !== 's') {
+                    // Clear stale cached value for unresolved formulas
+                    cell.display = '';
+                }
+            }
+        }
     }
 
     function parseStyles(stylesXml) {
