@@ -535,6 +535,61 @@ const TemplateEngine = (() => {
             newZip.file('xl/workbook.xml', updatedWb);
         }
 
+        // === Remove extra sheets from output ZIP ===
+        // The template may have multiple sheets (e.g. 8 monthly sheets).
+        // Only keep the first modified sheet to avoid duplicate footer content.
+        {
+            const wbXml2 = await newZip.file('xl/workbook.xml').async('string');
+            const wbDoc2 = new DOMParser().parseFromString(wbXml2, 'application/xml');
+            const sheetNodes2 = wbDoc2.getElementsByTagName('sheet');
+
+            // Collect rIds of sheets to remove (all except first)
+            const relsXml2 = await newZip.file('xl/_rels/workbook.xml.rels').async('string');
+            const relsDoc2 = new DOMParser().parseFromString(relsXml2, 'application/xml');
+            const relNodes2 = relsDoc2.getElementsByTagName('Relationship');
+
+            // Build rId -> target map
+            const rIdMap = {};
+            for (let i = 0; i < relNodes2.length; i++) {
+                rIdMap[relNodes2[i].getAttribute('Id')] = relNodes2[i].getAttribute('Target');
+            }
+
+            // Remove sheets 2+ from workbook.xml and their files
+            const rIdsToRemove = [];
+            for (let i = sheetNodes2.length - 1; i >= 1; i--) {
+                const rId = sheetNodes2[i].getAttribute('r:id') ||
+                    sheetNodes2[i].getAttributeNS(REL_NS, 'id');
+                if (rId) rIdsToRemove.push(rId);
+                sheetNodes2[i].parentNode.removeChild(sheetNodes2[i]);
+            }
+
+            // Remove corresponding sheet files and relationship entries
+            for (const rId of rIdsToRemove) {
+                const target = rIdMap[rId];
+                if (target) {
+                    const fullPath = target.startsWith('/') ? target.substring(1) : `xl/${target}`;
+                    newZip.remove(fullPath);
+                }
+                for (let i = relNodes2.length - 1; i >= 0; i--) {
+                    if (relNodes2[i].getAttribute('Id') === rId) {
+                        relNodes2[i].parentNode.removeChild(relNodes2[i]);
+                    }
+                }
+            }
+
+            // Save updated workbook.xml and rels
+            const ser = new XMLSerializer();
+            let wb2 = ser.serializeToString(wbDoc2);
+            wb2 = wb2.replace(/\s+xmlns:ns\d+="[^"]*"/g, '');
+            wb2 = wb2.replace(/ns\d+:/g, '');
+            newZip.file('xl/workbook.xml', wb2);
+
+            let rels2 = ser.serializeToString(relsDoc2);
+            rels2 = rels2.replace(/\s+xmlns:ns\d+="[^"]*"/g, '');
+            rels2 = rels2.replace(/ns\d+:/g, '');
+            newZip.file('xl/_rels/workbook.xml.rels', rels2);
+        }
+
         // Generate blob WITH compression
         const blob = await newZip.generateAsync({
             type: 'blob',

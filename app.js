@@ -494,6 +494,64 @@
         }
     }
 
+    /**
+     * Strip footer-like rows and trailing blanks from data.
+     * The input data file often contains its own footer (小計/税金/合計/備考)
+     * which would duplicate the template's built-in footer.
+     */
+    function stripFooterRows(rows) {
+        // Footer keywords — rows containing these should be stripped
+        const FOOTER_KEYWORDS = [
+            '小計', '税金', '合計', '備考', 'Subtotal', 'Total', '消費税',
+            'Tổng', 'Ghi chú', 'Note', 'Remarks',
+        ];
+
+        // Category header keywords — strip these too (template has its own structure)
+        const CATEGORY_KEYWORDS = [
+            'Reagent', 'Calibrator', 'Control', 'カテゴリ', 'Category',
+        ];
+
+        const isFooterRow = (row) => {
+            // Check if any cell in the row matches a footer keyword
+            for (const cell of row) {
+                const val = String(cell ?? '').trim();
+                if (val.length === 0) continue;
+                for (const kw of FOOTER_KEYWORDS) {
+                    if (val.includes(kw)) return true;
+                }
+            }
+            return false;
+        };
+
+        const isCategoryRow = (row) => {
+            // Category rows: first cell is NOT a number, and text matches category keywords
+            const firstVal = String(row[0] ?? '').trim();
+            if (firstVal.length > 0 && !isNaN(parseInt(firstVal))) return false; // Data row
+            for (const cell of row) {
+                const val = String(cell ?? '').trim();
+                for (const kw of CATEGORY_KEYWORDS) {
+                    if (val.includes(kw)) return true;
+                }
+            }
+            return false;
+        };
+
+        const isBlankRow = (row) => {
+            return row.every(cell => String(cell ?? '').trim().length === 0);
+        };
+
+        // Filter: keep only real data rows (not footer, not category headers, not blank)
+        const filtered = [];
+        for (const row of rows) {
+            if (isFooterRow(row)) continue;
+            if (isCategoryRow(row)) continue;
+            if (isBlankRow(row)) continue;
+            filtered.push(row);
+        }
+
+        return filtered;
+    }
+
     function mapDataToTemplate(sheet) {
         if (!columnMapping || !templateSummary) return sheet.rows;
 
@@ -514,7 +572,8 @@
             mappedRows.push(mappedRow);
         }
 
-        return mappedRows;
+        // Strip footer-like rows and blanks from the mapped data
+        return stripFooterRows(mappedRows);
     }
 
     function getSelectedTemplate() {

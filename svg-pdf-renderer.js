@@ -113,7 +113,16 @@ const SVGPDFRenderer = (() => {
         const shiftedFooter = footerRows.map(r => ({
             ...r,
             rowNum: r.rowNum + shift,
-            cells: r.cells.map(c => ({ ...c })),
+            cells: r.cells.map(c => {
+                const copy = { ...c };
+                // Clear cached formula values (numeric cells) in footer.
+                // These are stale results from the template's original data.
+                // Labels like 小計/税金 are shared strings (t='s') and are preserved.
+                if (copy.t !== 's' && copy.display && !isNaN(parseFloat(copy.display))) {
+                    copy.display = '';
+                }
+                return copy;
+            }),
         }));
 
         // Adjust merges

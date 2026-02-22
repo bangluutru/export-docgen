@@ -3,13 +3,14 @@
 
 <head>
     <meta charset="UTF-8">
-    <title>Formula Debug Test</title>
+    <title>Deep Template Row Dump</title>
     <style>
         body {
             font-family: monospace;
             background: #111;
             color: #eee;
             padding: 20px;
+            font-size: 12px;
         }
 
         .pass {
@@ -28,16 +29,26 @@
             color: #fa0;
         }
 
+        .important {
+            color: #f0f;
+            font-weight: bold;
+        }
+
         h2 {
             color: #aaf;
             margin-top: 20px;
         }
 
-        pre {
-            background: #222;
-            padding: 10px;
-            border-radius: 4px;
-            overflow-x: auto;
+        .data {
+            color: #8d8;
+        }
+
+        .footer {
+            color: #f88;
+        }
+
+        .header {
+            color: #88f;
         }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -46,7 +57,7 @@
 </head>
 
 <body>
-    <h1>Formula & Footer Debug</h1>
+    <h1>Deep Template Row Dump — Finding Duplicate Footer Source</h1>
     <div id="output"></div>
     <script>
         const out = document.getElementById('output');
@@ -55,55 +66,20 @@
 
         window.addEventListener('load', async () => {
             try {
-                // 1. Load template
-                section('1. Template Analysis');
                 const resp = await fetch('/template_mau.xlsx');
                 const buffer = await resp.arrayBuffer();
-                const templateData = await TemplateEngine.analyzeTemplate(buffer);
-                const analysis = templateData.analysis;
 
-                log(`Data zone: rows ${analysis.dataZone.startRowNum} - ${analysis.dataZone.endRowNum}`);
-                log(`Footer zone starts at index ${analysis.footerZone.startIdx}`);
-                log(`Footer rows count: ${analysis.footerZone.rows.length}`);
+                // Direct XML parsing to see EVERY row
+                section('1. Raw Template XML — ALL Rows of Sheet 1');
+                const zip = await JSZip.loadAsync(buffer);
 
-                // Show footer rows with their contents
-                section('2. Original Footer Rows');
-                for (const row of analysis.footerZone.rows) {
-                    const cellInfo = row.cells.map(c => {
-                        let desc = `${c.ref}=[${c.displayValue || ''}]`;
-                        if (c.formula) desc += ` F:(${c.formula})`;
-                        return desc;
-                    }).join(', ');
-                    log(`  Row ${row.rowNum}: ${cellInfo}`);
-                }
+                // Get sheet paths
+                const relsXml = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+                log(`Rels XML length: ${relsXml.length}`);
 
-                // 3. Generate with test data (same count as original template data rows)
-                section('3. Generate with SAME count of data rows');
-                const origDataCount = analysis.dataZone.endRowNum - analysis.dataZone.startRowNum + 1;
-                log(`Original data row count: ${origDataCount}`);
-
-                const testData30 = [];
-                for (let i = 0; i < 30; i++) {
-                    testData30.push([
-                        i + 1, `Product ${i + 1}`, `(1x60 mL+1x20 mL)`, 130000, i * 10 + 10, 50 + i, 6500000
-                    ]);
-                }
-
-                const blob = await TemplateEngine.generateFromTemplate(templateData, {
-                    rows: testData30,
-                    sheetName: 'Test30Rows',
-                });
-
-                // 4. Parse the output and check formulas
-                section('4. Output Analysis — Formulas');
-                const outZip = await JSZip.loadAsync(await blob.arrayBuffer());
-                const sheetXml = await outZip.file('xl/worksheets/sheet1.xml').async('string');
-                const doc = new DOMParser().parseFromString(sheetXml, 'application/xml');
-                const allRows = doc.getElementsByTagName('row');
-
-                // Find footer rows (those with formulas or specific text)
-                const sharedStrXml = await outZip.file('xl/sharedStrings.xml').async('string');
-                const ssDoc = new DOMParser().parseFromString(sharedStrXml, 'application/xml');
+                // Parse shared strings
+                const ssXml = await zip.file('xl/sharedStrings.xml').async('string');
+                const ssDoc = new DOMParser().parseFromString(ssXml, 'application/xml');
                 const siNodes = ssDoc.getElementsByTagName('si');
                 const strings = [];
                 for (let i = 0; i < siNodes.length; i++) {
@@ -112,22 +88,35 @@
                     for (let j = 0; j < tNodes.length; j++) text += tNodes[j].textContent || '';
                     strings.push(text);
                 }
+                log(`Shared strings: ${strings.length}`);
 
-                log(`Total rows in output: ${allRows.length}`);
-                log('');
+                // Find all sheet files
+                const sheetFiles = [];
+                zip.forEach((path, entry) => {
+                    if (path.match(/xl\/worksheets\/sheet\d+\.xml/)) {
+                        sheetFiles.push(path);
+                    }
+                });
+                sheetFiles.sort();
+                log(`Sheet files found: ${sheetFiles.join(', ')}`);
 
-                // Show all rows from data end onwards
-                const expectedDataEnd = analysis.dataZone.startRowNum + 30 - 1; // 30 data rows
-                log(`Expected data end row: ${expectedDataEnd}`);
+                // Parse FIRST sheet — dump every row
+                const sheetXml = await zip.file(sheetFiles[0]).async('string');
+                const doc = new DOMParser().parseFromString(sheetXml, 'application/xml');
+                const allRows = doc.getElementsByTagName('row');
+
+                log(`\nTotal rows in sheet1: ${allRows.length}`);
                 log('');
 
                 for (let i = 0; i < allRows.length; i++) {
                     const row = allRows[i];
                     const rn = parseInt(row.getAttribute('r'));
-                    if (rn < expectedDataEnd - 2) continue; // Show rows near end of data zone
-
                     const cells = row.getElementsByTagName('c');
+
                     const cellDescs = [];
+                    let hasFormula = false;
+                    let hasSubtotal = false;
+
                     for (let j = 0; j < cells.length; j++) {
                         const c = cells[j];
                         const ref = c.getAttribute('r');
@@ -136,65 +125,115 @@
                         const f = c.getElementsByTagName('f')[0];
 
                         let desc = ref;
+                        let displayText = '';
                         if (t === 's' && v) {
                             const idx = parseInt(v.textContent);
-                            desc += `="${strings[idx] || '??'}"`;
+                            displayText = strings[idx] || '??';
+                            desc += `="${displayText}"`;
                         } else if (v) {
                             desc += `=${v.textContent}`;
+                            displayText = v.textContent;
                         }
                         if (f) {
-                            desc += ` FORMULA:(${f.textContent})`;
+                            desc += ` F:(${f.textContent})`;
+                            hasFormula = true;
                         }
+
+                        if (displayText.includes('小計') || displayText.includes('合計') ||
+                            displayText.includes('税金') || displayText.includes('備考')) {
+                            hasSubtotal = true;
+                        }
+
                         cellDescs.push(desc);
                     }
 
-                    const isData = rn >= analysis.dataZone.startRowNum && rn <= expectedDataEnd;
-                    const zone = rn < analysis.dataZone.startRowNum ? '[HEADER]' : isData ? '[DATA]' : '[FOOTER]';
-                    log(`  Row ${rn} ${zone}: ${cellDescs.join(' | ')}`,
-                        cellDescs.some(d => d.includes('FORMULA')) ? 'warn' : 'info');
+                    let zone = '';
+                    let cls = 'info';
+                    if (rn <= 14) { zone = '[HEADER]'; cls = 'header'; }
+                    else if (rn === 15) { zone = '[COL-HDR]'; cls = 'header'; }
+                    else if (rn >= 16 && rn <= 53) { zone = '[DATA]'; cls = 'data'; }
+                    else { zone = '[FOOTER]'; cls = 'footer'; }
+
+                    if (hasSubtotal) cls = 'important';
+                    if (hasFormula) cls = 'warn';
+
+                    log(`Row ${rn} ${zone}: ${cellDescs.join(' | ')}`, cls);
                 }
 
-                // 5. Now test with fewer rows (simulating the typical scenario)
-                section('5. Generate with 28 rows (fewer than original 38)');
-                const testData28 = [];
+                // Now check: what does the analysis think?
+                section('2. Template Engine Analysis');
+                const templateData = await TemplateEngine.analyzeTemplate(buffer);
+                const analysis = templateData.analysis;
+
+                log(`Data zone: rows ${analysis.dataZone.startRowNum} - ${analysis.dataZone.endRowNum}`);
+                log(`Footer zone startIdx: ${analysis.footerZone.startIdx}`);
+                log(`Footer rows: ${analysis.footerZone.rows.length}`);
+                log(`Category rows: ${analysis.dataZone.categoryRows?.length || 0}`);
+
+                if (analysis.dataZone.categoryRows?.length > 0) {
+                    log('\nCategory rows within data zone:');
+                    for (const cr of analysis.dataZone.categoryRows) {
+                        log(`  Index ${cr.index}: Row ${cr.row.rowNum} — ${cr.row.cells.map(c => c.displayValue).join(' | ')}`, 'important');
+                    }
+                }
+
+                log('\nFooter row details:');
+                for (const fr of analysis.footerZone.rows) {
+                    const cellInfo = fr.cells.map(c => {
+                        let desc = `${c.ref}=[${c.displayValue || ''}]`;
+                        if (c.formula) desc += ` F:(${c.formula})`;
+                        return desc;
+                    }).join(', ');
+                    log(`  Row ${fr.rowNum}: ${cellInfo}`, fr.cells.some(c => c.formula) ? 'warn' : 'footer');
+                }
+
+                // Now generate with 28 rows and dump the OUTPUT
+                section('3. Generated Output — 28 rows');
+                const testData = [];
                 for (let i = 0; i < 28; i++) {
-                    testData28.push([
+                    testData.push([
                         i + 4, `Measure ${String.fromCharCode(65 + (i % 26))}`,
-                        `(1x60 mL+1x20 mL)`, 130000 + i * 10000, 50, 6500000 + i * 100000
+                        `(1x60 mL+1x20 mL)`, 130000 + i * 10000, 50, 50, 6500000 + i * 100000
                     ]);
                 }
 
-                const blob28 = await TemplateEngine.generateFromTemplate(templateData, {
-                    rows: testData28,
-                    sheetName: 'Test28Rows',
+                const blob = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: testData,
+                    sheetName: 'TestOutput',
                 });
 
-                const outZip28 = await JSZip.loadAsync(await blob28.arrayBuffer());
-                const sheetXml28 = await outZip28.file('xl/worksheets/sheet1.xml').async('string');
-                const doc28 = new DOMParser().parseFromString(sheetXml28, 'application/xml');
-                const allRows28 = doc28.getElementsByTagName('row');
+                const outZip = await JSZip.loadAsync(await blob.arrayBuffer());
+                const outSheetXml = await outZip.file(templateData.firstSheetPath).async('string');
+                const outDoc = new DOMParser().parseFromString(outSheetXml, 'application/xml');
+                const outRows = outDoc.getElementsByTagName('row');
 
-                const ssXml28 = await outZip28.file('xl/sharedStrings.xml').async('string');
-                const ssDoc28 = new DOMParser().parseFromString(ssXml28, 'application/xml');
-                const siNodes28 = ssDoc28.getElementsByTagName('si');
-                const strings28 = [];
-                for (let i = 0; i < siNodes28.length; i++) {
-                    const tNodes = siNodes28[i].getElementsByTagName('t');
+                // New shared strings
+                const outSsXml = await outZip.file('xl/sharedStrings.xml').async('string');
+                const outSsDoc = new DOMParser().parseFromString(outSsXml, 'application/xml');
+                const outSiNodes = outSsDoc.getElementsByTagName('si');
+                const outStrings = [];
+                for (let i = 0; i < outSiNodes.length; i++) {
+                    const tNodes = outSiNodes[i].getElementsByTagName('t');
                     let text = '';
                     for (let j = 0; j < tNodes.length; j++) text += tNodes[j].textContent || '';
-                    strings28.push(text);
+                    outStrings.push(text);
                 }
 
-                const expectedDataEnd28 = analysis.dataZone.startRowNum + 28 - 1;
-                log(`Expected data end row: ${expectedDataEnd28}`);
+                const expectedDataEnd = 16 + 28 - 1; // = 43
+                log(`Expected data end: row ${expectedDataEnd}`);
+                log(`Total output rows: ${outRows.length}`);
+                log('');
 
-                for (let i = 0; i < allRows28.length; i++) {
-                    const row = allRows28[i];
+                // Show all rows from near end of data
+                for (let i = 0; i < outRows.length; i++) {
+                    const row = outRows[i];
                     const rn = parseInt(row.getAttribute('r'));
-                    if (rn < expectedDataEnd28 - 2) continue;
+                    if (rn < expectedDataEnd - 2) continue; // Show from near end
 
                     const cells = row.getElementsByTagName('c');
                     const cellDescs = [];
+                    let hasSubtotal = false;
+
                     for (let j = 0; j < cells.length; j++) {
                         const c = cells[j];
                         const ref = c.getAttribute('r');
@@ -203,37 +242,61 @@
                         const f = c.getElementsByTagName('f')[0];
 
                         let desc = ref;
+                        let displayText = '';
                         if (t === 's' && v) {
                             const idx = parseInt(v.textContent);
-                            desc += `="${strings28[idx] || '??'}"`;
+                            displayText = outStrings[idx] || '??';
+                            desc += `="${displayText}"`;
                         } else if (v) {
                             desc += `=${v.textContent}`;
                         }
-                        if (f) {
-                            desc += ` FORMULA:(${f.textContent})`;
+                        if (f) desc += ` F:(${f.textContent})`;
+                        if (displayText.includes('小計') || displayText.includes('合計') ||
+                            displayText.includes('税金') || displayText.includes('備考')) {
+                            hasSubtotal = true;
                         }
                         cellDescs.push(desc);
                     }
 
-                    const isData = rn >= analysis.dataZone.startRowNum && rn <= expectedDataEnd28;
-                    const zone = rn < analysis.dataZone.startRowNum ? '[HEADER]' : isData ? '[DATA]' : '[FOOTER]';
-                    log(`  Row ${rn} ${zone}: ${cellDescs.join(' | ')}`,
-                        cellDescs.some(d => d.includes('FORMULA')) ? 'warn' : 'info');
+                    log(`Row ${rn}: ${cellDescs.join(' | ')}`, hasSubtotal ? 'important' : 'info');
                 }
 
-                // 6. Show merge cells in output
-                section('6. Merge Cells in Output (28 rows)');
-                const mergeNodes28 = doc28.getElementsByTagName('mergeCell');
-                for (let i = 0; i < mergeNodes28.length; i++) {
-                    const ref = mergeNodes28[i].getAttribute('ref');
-                    // Only show footer-area merges (after data end)
-                    const match = ref.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
-                    if (match) {
-                        const r1 = parseInt(match[2]);
-                        if (r1 > expectedDataEnd28 - 5) {
-                            log(`  Merge: ${ref}`, 'info');
+                // Check OTHER sheets in output
+                section('4. Other Sheets in Output');
+                const outSheetFiles = [];
+                outZip.forEach((path, entry) => {
+                    if (path.match(/xl\/worksheets\/sheet\d+\.xml/)) {
+                        outSheetFiles.push(path);
+                    }
+                });
+                outSheetFiles.sort();
+                log(`Sheet files in output: ${outSheetFiles.join(', ')}`);
+
+                for (const sf of outSheetFiles) {
+                    if (sf === templateData.firstSheetPath) continue; // Skip first sheet (already analyzed)
+                    const shXml = await outZip.file(sf).async('string');
+                    const shDoc = new DOMParser().parseFromString(shXml, 'application/xml');
+                    const shRows = shDoc.getElementsByTagName('row');
+                    let rowCount = shRows.length;
+
+                    // Check for 小計 content
+                    let hasSubtotal = false;
+                    for (let i = 0; i < shRows.length; i++) {
+                        const cells = shRows[i].getElementsByTagName('c');
+                        for (let j = 0; j < cells.length; j++) {
+                            const t = cells[j].getAttribute('t') || '';
+                            const v = cells[j].getElementsByTagName('v')[0];
+                            if (t === 's' && v) {
+                                const idx = parseInt(v.textContent);
+                                if (outStrings[idx]?.includes('小計') ||
+                                    outStrings[idx]?.includes('備考')) {
+                                    hasSubtotal = true;
+                                }
+                            }
                         }
                     }
+
+                    log(`${sf}: ${rowCount} rows, has小計/備考: ${hasSubtotal}`, hasSubtotal ? 'important' : 'info');
                 }
 
                 log('\nDone!', 'pass');
