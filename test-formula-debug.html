@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Formula Debug Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #111;
+            color: #eee;
+            padding: 20px;
+        }
+
+        .pass {
+            color: #4f4;
+        }
+
+        .fail {
+            color: #f44;
+        }
+
+        .info {
+            color: #8af;
+        }
+
+        .warn {
+            color: #fa0;
+        }
+
+        h2 {
+            color: #aaf;
+            margin-top: 20px;
+        }
+
+        pre {
+            background: #222;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="xlsx-reader.js"></script>
+    <script src="template-engine.js"></script>
+</head>
+
+<body>
+    <h1>Formula & Footer Debug</h1>
+    <div id="output"></div>
+    <script>
+        const out = document.getElementById('output');
+        function log(msg, cls = 'info') { out.innerHTML += `<div class="${cls}">${msg}</div>`; }
+        function section(title) { out.innerHTML += `<h2>${title}</h2>`; }
+
+        window.addEventListener('load', async () => {
+            try {
+                // 1. Load template
+                section('1. Template Analysis');
+                const resp = await fetch('/template_mau.xlsx');
+                const buffer = await resp.arrayBuffer();
+                const templateData = await TemplateEngine.analyzeTemplate(buffer);
+                const analysis = templateData.analysis;
+
+                log(`Data zone: rows ${analysis.dataZone.startRowNum} - ${analysis.dataZone.endRowNum}`);
+                log(`Footer zone starts at index ${analysis.footerZone.startIdx}`);
+                log(`Footer rows count: ${analysis.footerZone.rows.length}`);
+
+                // Show footer rows with their contents
+                section('2. Original Footer Rows');
+                for (const row of analysis.footerZone.rows) {
+                    const cellInfo = row.cells.map(c => {
+                        let desc = `${c.ref}=[${c.displayValue || ''}]`;
+                        if (c.formula) desc += ` F:(${c.formula})`;
+                        return desc;
+                    }).join(', ');
+                    log(`  Row ${row.rowNum}: ${cellInfo}`);
+                }
+
+                // 3. Generate with test data (same count as original template data rows)
+                section('3. Generate with SAME count of data rows');
+                const origDataCount = analysis.dataZone.endRowNum - analysis.dataZone.startRowNum + 1;
+                log(`Original data row count: ${origDataCount}`);
+
+                const testData30 = [];
+                for (let i = 0; i < 30; i++) {
+                    testData30.push([
+                        i + 1, `Product ${i + 1}`, `(1x60 mL+1x20 mL)`, 130000, i * 10 + 10, 50 + i, 6500000
+                    ]);
+                }
+
+                const blob = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: testData30,
+                    sheetName: 'Test30Rows',
+                });
+
+                // 4. Parse the output and check formulas
+                section('4. Output Analysis — Formulas');
+                const outZip = await JSZip.loadAsync(await blob.arrayBuffer());
+                const sheetXml = await outZip.file('xl/worksheets/sheet1.xml').async('string');
+                const doc = new DOMParser().parseFromString(sheetXml, 'application/xml');
+                const allRows = doc.getElementsByTagName('row');
+
+                // Find footer rows (those with formulas or specific text)
+                const sharedStrXml = await outZip.file('xl/sharedStrings.xml').async('string');
+                const ssDoc = new DOMParser().parseFromString(sharedStrXml, 'application/xml');
+                const siNodes = ssDoc.getElementsByTagName('si');
+                const strings = [];
+                for (let i = 0; i < siNodes.length; i++) {
+                    const tNodes = siNodes[i].getElementsByTagName('t');
+                    let text = '';
+                    for (let j = 0; j < tNodes.length; j++) text += tNodes[j].textContent || '';
+                    strings.push(text);
+                }
+
+                log(`Total rows in output: ${allRows.length}`);
+                log('');
+
+                // Show all rows from data end onwards
+                const expectedDataEnd = analysis.dataZone.startRowNum + 30 - 1; // 30 data rows
+                log(`Expected data end row: ${expectedDataEnd}`);
+                log('');
+
+                for (let i = 0; i < allRows.length; i++) {
+                    const row = allRows[i];
+                    const rn = parseInt(row.getAttribute('r'));
+                    if (rn < expectedDataEnd - 2) continue; // Show rows near end of data zone
+
+                    const cells = row.getElementsByTagName('c');
+                    const cellDescs = [];
+                    for (let j = 0; j < cells.length; j++) {
+                        const c = cells[j];
+                        const ref = c.getAttribute('r');
+                        const t = c.getAttribute('t') || '';
+                        const v = c.getElementsByTagName('v')[0];
+                        const f = c.getElementsByTagName('f')[0];
+
+                        let desc = ref;
+                        if (t === 's' && v) {
+                            const idx = parseInt(v.textContent);
+                            desc += `="${strings[idx] || '??'}"`;
+                        } else if (v) {
+                            desc += `=${v.textContent}`;
+                        }
+                        if (f) {
+                            desc += ` FORMULA:(${f.textContent})`;
+                        }
+                        cellDescs.push(desc);
+                    }
+
+                    const isData = rn >= analysis.dataZone.startRowNum && rn <= expectedDataEnd;
+                    const zone = rn < analysis.dataZone.startRowNum ? '[HEADER]' : isData ? '[DATA]' : '[FOOTER]';
+                    log(`  Row ${rn} ${zone}: ${cellDescs.join(' | ')}`,
+                        cellDescs.some(d => d.includes('FORMULA')) ? 'warn' : 'info');
+                }
+
+                // 5. Now test with fewer rows (simulating the typical scenario)
+                section('5. Generate with 28 rows (fewer than original 38)');
+                const testData28 = [];
+                for (let i = 0; i < 28; i++) {
+                    testData28.push([
+                        i + 4, `Measure ${String.fromCharCode(65 + (i % 26))}`,
+                        `(1x60 mL+1x20 mL)`, 130000 + i * 10000, 50, 6500000 + i * 100000
+                    ]);
+                }
+
+                const blob28 = await TemplateEngine.generateFromTemplate(templateData, {
+                    rows: testData28,
+                    sheetName: 'Test28Rows',
+                });
+
+                const outZip28 = await JSZip.loadAsync(await blob28.arrayBuffer());
+                const sheetXml28 = await outZip28.file('xl/worksheets/sheet1.xml').async('string');
+                const doc28 = new DOMParser().parseFromString(sheetXml28, 'application/xml');
+                const allRows28 = doc28.getElementsByTagName('row');
+
+                const ssXml28 = await outZip28.file('xl/sharedStrings.xml').async('string');
+                const ssDoc28 = new DOMParser().parseFromString(ssXml28, 'application/xml');
+                const siNodes28 = ssDoc28.getElementsByTagName('si');
+                const strings28 = [];
+                for (let i = 0; i < siNodes28.length; i++) {
+                    const tNodes = siNodes28[i].getElementsByTagName('t');
+                    let text = '';
+                    for (let j = 0; j < tNodes.length; j++) text += tNodes[j].textContent || '';
+                    strings28.push(text);
+                }
+
+                const expectedDataEnd28 = analysis.dataZone.startRowNum + 28 - 1;
+                log(`Expected data end row: ${expectedDataEnd28}`);
+
+                for (let i = 0; i < allRows28.length; i++) {
+                    const row = allRows28[i];
+                    const rn = parseInt(row.getAttribute('r'));
+                    if (rn < expectedDataEnd28 - 2) continue;
+
+                    const cells = row.getElementsByTagName('c');
+                    const cellDescs = [];
+                    for (let j = 0; j < cells.length; j++) {
+                        const c = cells[j];
+                        const ref = c.getAttribute('r');
+                        const t = c.getAttribute('t') || '';
+                        const v = c.getElementsByTagName('v')[0];
+                        const f = c.getElementsByTagName('f')[0];
+
+                        let desc = ref;
+                        if (t === 's' && v) {
+                            const idx = parseInt(v.textContent);
+                            desc += `="${strings28[idx] || '??'}"`;
+                        } else if (v) {
+                            desc += `=${v.textContent}`;
+                        }
+                        if (f) {
+                            desc += ` FORMULA:(${f.textContent})`;
+                        }
+                        cellDescs.push(desc);
+                    }
+
+                    const isData = rn >= analysis.dataZone.startRowNum && rn <= expectedDataEnd28;
+                    const zone = rn < analysis.dataZone.startRowNum ? '[HEADER]' : isData ? '[DATA]' : '[FOOTER]';
+                    log(`  Row ${rn} ${zone}: ${cellDescs.join(' | ')}`,
+                        cellDescs.some(d => d.includes('FORMULA')) ? 'warn' : 'info');
+                }
+
+                // 6. Show merge cells in output
+                section('6. Merge Cells in Output (28 rows)');
+                const mergeNodes28 = doc28.getElementsByTagName('mergeCell');
+                for (let i = 0; i < mergeNodes28.length; i++) {
+                    const ref = mergeNodes28[i].getAttribute('ref');
+                    // Only show footer-area merges (after data end)
+                    const match = ref.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+                    if (match) {
+                        const r1 = parseInt(match[2]);
+                        if (r1 > expectedDataEnd28 - 5) {
+                            log(`  Merge: ${ref}`, 'info');
+                        }
+                    }
+                }
+
+                log('\nDone!', 'pass');
+            } catch (err) {
+                log('ERROR: ' + err.message, 'fail');
+                log(err.stack, 'fail');
+            }
+        });
+    </script>
+</body>
+
+</html>

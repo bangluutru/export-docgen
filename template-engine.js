@@ -820,33 +820,69 @@ const TemplateEngine = (() => {
     }
 
     /**
-     * Generic formula range updater — handles all columns, not just H
+     * Generic formula range updater — handles all columns, not just H.
+     * Handles multi-range formulas like SUM(H17:H45,H47:H53) correctly:
+     *   - Ranges within data zone are clamped to new data boundaries
+     *   - Orphaned ranges (start > newDataEnd after shift) are removed
+     *   - Footer references are shifted by rowShift
      */
     function updateFormulaRangesGeneric(formula, origDataStart, origDataEnd, newDataStart, newDataEnd, origFooterStart, newFooterStart) {
-        // Update cell range references like SUM(H17:H45) → SUM(H17:H30)
+        const rowShift = newFooterStart - origFooterStart;
+
+        // Step 1: Update cell range references (e.g. H17:H45)
+        // Process each range individually, marking orphaned ones for removal
         let result = formula.replace(
             /([A-Z]+)(\d+):([A-Z]+)(\d+)/g,
             (match, col1, row1, col2, row2) => {
                 const r1 = parseInt(row1);
                 const r2 = parseInt(row2);
-                // If range falls within or covers the original data area
-                if (r1 >= origDataStart && r1 <= origDataEnd + 20 && r2 >= origDataStart) {
-                    const newR1 = (r1 >= origFooterStart) ? newFooterStart + (r1 - origFooterStart) : r1;
-                    const newR2 = (r2 >= origFooterStart) ? newFooterStart + (r2 - origFooterStart)
-                        : (r2 <= origDataEnd) ? newDataEnd : newDataEnd;
-                    return `${col1}${newR1}:${col2}${newR2}`;
+
+                // Case A: Both ends in footer zone → shift both
+                if (r1 >= origFooterStart && r2 >= origFooterStart) {
+                    return `${col1}${r1 + rowShift}:${col2}${r2 + rowShift}`;
                 }
+
+                // Case B: Range within or covering the data zone
+                if (r1 >= origDataStart && r2 <= origDataEnd) {
+                    // If original r1 is already beyond the new data end,
+                    // this entire range is orphaned (no data rows exist here anymore)
+                    if (r1 > newDataEnd) {
+                        return '<<ORPHANED>>';
+                    }
+                    // Clamp r2 to newDataEnd (data zone may have shrunk)
+                    const newR2 = Math.min(r2, newDataEnd);
+                    return `${col1}${r1}:${col2}${newR2}`;
+                }
+
+                // Case C: Range starts in data/header, ends in footer
+                if (r1 < origFooterStart && r2 >= origFooterStart) {
+                    const newR2 = r2 + rowShift;
+                    return `${col1}${r1}:${col2}${newR2}`;
+                }
+
+                // Case D: Range starts before data, ends within data
+                if (r1 < origDataStart && r2 >= origDataStart && r2 <= origDataEnd) {
+                    return `${col1}${r1}:${col2}${newDataEnd}`;
+                }
+
                 return match;
             }
         );
 
-        // Update individual cell references in footer rows
+        // Step 2: Clean up orphaned ranges from multi-range formulas
+        // SUM(H17:H45,<<ORPHANED>>) → SUM(H17:H45)
+        // SUM(<<ORPHANED>>,H17:H45) → SUM(H17:H45)
+        result = result.replace(/,<<ORPHANED>>/g, '');
+        result = result.replace(/<<ORPHANED>>,/g, '');
+        result = result.replace(/<<ORPHANED>>/g, ''); // Solo orphan — shouldn't happen but safety
+
+        // Step 3: Update individual cell references in footer rows
         result = result.replace(
             /([A-Z]+)(\d+)(?![:\d])/g,
             (match, col, row) => {
                 const r = parseInt(row);
                 if (r >= origFooterStart) {
-                    return `${col}${newFooterStart + (r - origFooterStart)}`;
+                    return `${col}${r + rowShift}`;
                 }
                 return match;
             }
