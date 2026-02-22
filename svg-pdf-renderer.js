@@ -134,19 +134,48 @@ const SVGPDFRenderer = (() => {
         // Build merge map (must be before footer filter which uses it)
         const mergeMap = buildMergeMap(adjustedMerges);
 
-        // FIX 4: Remove empty footer rows (rows with no cell content at all)
+        // Reference list for origin lookup (includes all rows before filtering)
+        const allFinalRowsRaw = [...headerRows, ...newDataRows, ...shiftedFooter];
+
+        // IMPROVED FIX 4: Aggressively remove empty footer rows
+        // Step A: Filter out rows with no content, being smart about merge cells.
+        // Only preserve a merge-linked row if the merge's ORIGIN cell has content.
         const filteredFooter = shiftedFooter.filter(row => {
             // Keep rows that have at least one non-empty cell
             if (row.cells.some(c => c.display && String(c.display).trim().length > 0)) return true;
-            // Also keep rows that are part of merge cells (structural)
+
+            // Check if this row belongs to a merge whose ORIGIN has content
             for (const cell of row.cells) {
                 const key = `${row.rowNum},${cell.colNum}`;
-                if (mergeMap[key]) return true;
+                const merge = mergeMap[key];
+                if (merge && !merge.isOrigin) {
+                    // Find the origin cell's content
+                    const originRow = allFinalRowsRaw.find(r => r.rowNum === merge.startRow);
+                    if (originRow) {
+                        const originCell = originRow.cells.find(c => c.colNum === merge.startCol);
+                        if (originCell && originCell.display && String(originCell.display).trim().length > 0) {
+                            return true; // Origin has content — keep this row
+                        }
+                    }
+                }
             }
             return false;
         });
 
-        const allFinalRows = [...headerRows, ...newDataRows, ...filteredFooter];
+        // Step B: Trim trailing empty rows. Find last row with actual content,
+        // keep at most 1 empty row after it for spacing.
+        let lastContentIdx = -1;
+        for (let i = filteredFooter.length - 1; i >= 0; i--) {
+            if (filteredFooter[i].cells.some(c => c.display && String(c.display).trim().length > 0)) {
+                lastContentIdx = i;
+                break;
+            }
+        }
+        const trimmedFooter = lastContentIdx >= 0
+            ? filteredFooter.slice(0, lastContentIdx + 2) // +1 for content row, +1 for spacing
+            : [];
+
+        const allFinalRows = [...headerRows, ...newDataRows, ...trimmedFooter];
         allFinalRows.sort((a, b) => a.rowNum - b.rowNum);
 
         // 9. Calculate page dimensions (in pixels for HTML)
@@ -165,10 +194,10 @@ const SVGPDFRenderer = (() => {
             colPxWidths[c] = Math.round(((colWidths[c] || 8.43) / totalExcelW) * contentWidthPX);
         }
 
-        // FIX 5: Extract seal/stamp images from template
+        // FIX 5: Extract seal/stamp images from template with position info
         let sealImages = [];
         try {
-            sealImages = await extractTemplateImages(zip);
+            sealImages = await extractTemplateImages(zip, dataStart, dataEnd, shift);
         } catch (e) { /* ignore if no images */ }
 
         // 10. Build HTML table
@@ -451,14 +480,18 @@ const SVGPDFRenderer = (() => {
 
                 doc.addImage(imgData, 'JPEG', margins.left, margins.top, contentW, sliceHmm);
 
-                // FIX 5: Add seal image on first page (top-right corner of header)
+                // FIX 5: Add seal image on first page using anchor position from template
                 if (page === 0 && sealImages.length > 0) {
                     for (const seal of sealImages) {
                         try {
                             const sealW = 18; // mm
                             const sealH = 18;
-                            const sealX = pw - margins.right - sealW - 2;
-                            const sealY = margins.top + 10;
+                            // Convert anchor col/row to mm position
+                            // Approximate: each col ≈ contentW/maxCol, each row ≈ 4.5mm
+                            const approxColW = contentW / 8; // assume ~8 cols
+                            const approxRowH = 4.5; // mm per row
+                            const sealX = margins.left + (seal.anchorCol * approxColW);
+                            const sealY = margins.top + (seal.anchorRow * approxRowH);
                             doc.addImage(seal.dataUrl, 'PNG', sealX, sealY, sealW, sealH);
                         } catch (e) { /* skip bad images */ }
                     }
@@ -732,10 +765,10 @@ const SVGPDFRenderer = (() => {
 
     // ===== FIX 5: Extract template images (seal/stamp) =====
 
-    async function extractTemplateImages(zip) {
+    async function extractTemplateImages(zip, dataStart, dataEnd, rowShift) {
         const images = [];
 
-        // Find drawing relationships
+        // Find drawing relationships from sheet rels
         const relsPath = 'xl/worksheets/_rels/sheet1.xml.rels';
         const relsFile = zip.file(relsPath);
         if (!relsFile) return images;
@@ -744,7 +777,7 @@ const SVGPDFRenderer = (() => {
         const relsDoc = new DOMParser().parseFromString(relsXml, 'application/xml');
         const rels = relsDoc.getElementsByTagName('Relationship');
 
-        // Find drawing file
+        // Find drawing file path
         let drawingPath = null;
         for (let i = 0; i < rels.length; i++) {
             const type = rels[i].getAttribute('Type') || '';
@@ -756,7 +789,49 @@ const SVGPDFRenderer = (() => {
         }
         if (!drawingPath) return images;
 
-        // Find drawing rels to get image references
+        // Parse drawing XML for anchor positions
+        const drawingFile = zip.file(drawingPath);
+        if (!drawingFile) return images;
+        const drawingXml = await drawingFile.async('string');
+        const drawingDoc = new DOMParser().parseFromString(drawingXml, 'application/xml');
+
+        // Build a map of rId → anchor position from drawing XML
+        const anchorMap = {};
+        // Try twoCellAnchor elements
+        const anchors = drawingDoc.getElementsByTagName('xdr:twoCellAnchor');
+        for (let i = 0; i < anchors.length; i++) {
+            const from = anchors[i].getElementsByTagName('xdr:from')[0];
+            if (!from) continue;
+            const fromRow = parseInt(from.getElementsByTagName('xdr:row')[0]?.textContent || '0');
+            const fromCol = parseInt(from.getElementsByTagName('xdr:col')[0]?.textContent || '0');
+
+            // Get the relationship ID from blipFill
+            const blips = anchors[i].getElementsByTagName('a:blip');
+            for (let j = 0; j < blips.length; j++) {
+                const rEmbed = blips[j].getAttribute('r:embed');
+                if (rEmbed) {
+                    anchorMap[rEmbed] = { row: fromRow, col: fromCol };
+                }
+            }
+        }
+        // Also try oneCellAnchor
+        const oneAnchors = drawingDoc.getElementsByTagName('xdr:oneCellAnchor');
+        for (let i = 0; i < oneAnchors.length; i++) {
+            const from = oneAnchors[i].getElementsByTagName('xdr:from')[0];
+            if (!from) continue;
+            const fromRow = parseInt(from.getElementsByTagName('xdr:row')[0]?.textContent || '0');
+            const fromCol = parseInt(from.getElementsByTagName('xdr:col')[0]?.textContent || '0');
+
+            const blips = oneAnchors[i].getElementsByTagName('a:blip');
+            for (let j = 0; j < blips.length; j++) {
+                const rEmbed = blips[j].getAttribute('r:embed');
+                if (rEmbed) {
+                    anchorMap[rEmbed] = { row: fromRow, col: fromCol };
+                }
+            }
+        }
+
+        // Find drawing rels to map rId → image file
         const drawingRelsPath = drawingPath.replace('drawings/', 'drawings/_rels/') + '.rels';
         const drawingRelsFile = zip.file(drawingRelsPath);
         if (!drawingRelsFile) return images;
@@ -769,6 +844,7 @@ const SVGPDFRenderer = (() => {
             const type = imgRels[i].getAttribute('Type') || '';
             if (!type.includes('image')) continue;
 
+            const rId = imgRels[i].getAttribute('Id') || '';
             const target = imgRels[i].getAttribute('Target') || '';
             const imgPath = target.startsWith('/') ? target.substring(1) : 'xl/' + target.replace('../', '');
 
@@ -779,9 +855,13 @@ const SVGPDFRenderer = (() => {
                 const imgData = await imgFile.async('base64');
                 const ext = imgPath.split('.').pop().toLowerCase();
                 const mime = ext === 'png' ? 'image/png' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png';
+                const anchor = anchorMap[rId] || { row: 3, col: 6 }; // default to header area if no anchor
+
                 images.push({
                     dataUrl: `data:${mime};base64,${imgData}`,
                     path: imgPath,
+                    anchorRow: anchor.row,
+                    anchorCol: anchor.col,
                 });
             } catch (e) { /* skip unreadable images */ }
         }
