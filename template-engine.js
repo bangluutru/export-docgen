@@ -593,15 +593,15 @@ const TemplateEngine = (() => {
         rowsToRemove.forEach(row => sheetData.removeChild(row));
 
         // === Step 3: Build new data rows ===
-        const hasR1R2 = stylePatterns.length >= 2;
-        const patternCycleLen = hasR1R2 ? 2 : 1;
+        // FIX: Use ONLY the first style pattern for ALL rows to ensure consistent font size.
+        // Template may have 2+ data rows with different font sizes — cycling causes alternating sizes.
+        const patternCycleLen = 1; // Always use pattern[0]
         let currentRowNum = dataStartRowNum;
         const newDataRowNodes = [];
 
         for (let i = 0; i < newDataRows.length; i++) {
             const dataRow = newDataRows[i];
-            const patternIdx = i % patternCycleLen;
-            const pattern = stylePatterns[Math.min(patternIdx, stylePatterns.length - 1)];
+            const pattern = stylePatterns[0]; // Always use first pattern
 
             const rowEl = doc.createElementNS(XLSX_NS, 'row');
             rowEl.setAttribute('r', String(currentRowNum));

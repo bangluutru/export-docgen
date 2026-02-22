@@ -79,36 +79,33 @@ const SVGPDFRenderer = (() => {
         const tplDataRows = allRows.filter(r => r.rowNum >= dataStart && r.rowNum <= dataEnd);
         const footerRows = allRows.filter(r => r.rowNum > dataEnd);
 
-        // Style patterns
-        const stylePatterns = tplDataRows.map(tr => ({
-            cellStyles: {},
-            ht: tr.ht,
-        }));
-        for (const tr of tplDataRows) {
-            const pi = tplDataRows.indexOf(tr);
-            for (const cell of tr.cells) {
-                stylePatterns[pi].cellStyles[cell.colNum] = cell.s;
+        // FIX 1: Use ONLY the first data row style pattern for consistent font size.
+        // Template may have 2+ data rows with DIFFERENT font sizes — cycling them causes
+        // alternating large/small text. Using only pattern[0] ensures uniformity.
+        const firstPattern = { cellStyles: {}, ht: 18 };
+        if (tplDataRows.length > 0) {
+            firstPattern.ht = tplDataRows[0].ht || 18;
+            for (const cell of tplDataRows[0].cells) {
+                firstPattern.cellStyles[cell.colNum] = cell.s;
             }
         }
 
-        // New data rows
+        // New data rows — all use the SAME style pattern
         const newDataRows = [];
         for (let ri = 0; ri < dataRows.length; ri++) {
             const rowData = dataRows[ri];
             const rowNum = dataStart + ri;
-            const patIdx = ri % Math.max(1, stylePatterns.length);
-            const pat = stylePatterns[patIdx] || stylePatterns[0];
 
             const cells = [];
             for (let ci = 0; ci < Math.min(rowData.length, maxCol); ci++) {
                 cells.push({
                     colNum: ci + 1,
-                    s: pat?.cellStyles[ci + 1] || 0,
+                    s: firstPattern.cellStyles[ci + 1] || 0,
                     display: String(rowData[ci] ?? ''),
                     t: '',
                 });
             }
-            newDataRows.push({ rowNum, ht: pat?.ht || 18, cells });
+            newDataRows.push({ rowNum, ht: firstPattern.ht, cells });
         }
 
         // Shift footer
@@ -134,11 +131,23 @@ const SVGPDFRenderer = (() => {
             }
         }
 
-        const allFinalRows = [...headerRows, ...newDataRows, ...shiftedFooter];
-        allFinalRows.sort((a, b) => a.rowNum - b.rowNum);
-
-        // Build merge map
+        // Build merge map (must be before footer filter which uses it)
         const mergeMap = buildMergeMap(adjustedMerges);
+
+        // FIX 4: Remove empty footer rows (rows with no cell content at all)
+        const filteredFooter = shiftedFooter.filter(row => {
+            // Keep rows that have at least one non-empty cell
+            if (row.cells.some(c => c.display && String(c.display).trim().length > 0)) return true;
+            // Also keep rows that are part of merge cells (structural)
+            for (const cell of row.cells) {
+                const key = `${row.rowNum},${cell.colNum}`;
+                if (mergeMap[key]) return true;
+            }
+            return false;
+        });
+
+        const allFinalRows = [...headerRows, ...newDataRows, ...filteredFooter];
+        allFinalRows.sort((a, b) => a.rowNum - b.rowNum);
 
         // 9. Calculate page dimensions (in pixels for HTML)
         const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
@@ -156,11 +165,17 @@ const SVGPDFRenderer = (() => {
             colPxWidths[c] = Math.round(((colWidths[c] || 8.43) / totalExcelW) * contentWidthPX);
         }
 
+        // FIX 5: Extract seal/stamp images from template
+        let sealImages = [];
+        try {
+            sealImages = await extractTemplateImages(zip);
+        } catch (e) { /* ignore if no images */ }
+
         // 10. Build HTML table
         const html = buildFullHTML(allFinalRows, mergeMap, styles, maxCol, colPxWidths, contentWidthPX, dataStart);
 
-        // 11. Render HTML → Canvas → PDF
-        return await htmlCanvasToPDF(html, pageSize, landscape, margins, contentWidthPX);
+        // 11. Render HTML → Canvas → PDF (with row-aware page breaks)
+        return await htmlCanvasToPDF(html, pageSize, landscape, margins, contentWidthPX, sealImages);
     }
 
     // ===== Build HTML table =====
@@ -279,7 +294,7 @@ const SVGPDFRenderer = (() => {
         const xf = styles.xfs[cell.s] || {};
         const font = styles.fonts[xf.fontId] || {};
         const fill = styles.fills[xf.fillId] || {};
-        const border = styles.borders[xf.borderId] || {};
+        const border = isHeaderZone ? {} : (styles.borders[xf.borderId] || {}); // FIX 2: No borders in header zone
         const align = xf.alignment || {};
 
         // Font
@@ -338,13 +353,14 @@ const SVGPDFRenderer = (() => {
 
     // ===== HTML → Canvas → PDF =====
 
-    async function htmlCanvasToPDF(html, pageSize, landscape, margins) {
+    async function htmlCanvasToPDF(html, pageSize, landscape, margins, contentWidthPX, sealImages) {
         const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
         const pw = landscape ? pgBase.h : pgBase.w;
         const ph = landscape ? pgBase.w : pgBase.h;
         const contentW = pw - margins.left - margins.right;
         const contentH = ph - margins.top - margins.bottom;
         const PX_PER_MM = 3.78;
+        const SCALE = 2;
         const contentWpx = Math.round(contentW * PX_PER_MM);
 
         // Create visible container (behind loading overlay)
@@ -361,9 +377,19 @@ const SVGPDFRenderer = (() => {
         await new Promise(r => setTimeout(r, 100));
 
         try {
+            // FIX 3: Get row Y positions for row-boundary-aware page breaks
+            const table = container.querySelector('table');
+            const trElements = table ? table.querySelectorAll('tr') : [];
+            const rowBottoms = []; // Y bottom of each row in CSS pixels
+            for (const tr of trElements) {
+                const rect = tr.getBoundingClientRect();
+                const tableRect = table.getBoundingClientRect();
+                rowBottoms.push(Math.round(rect.bottom - tableRect.top));
+            }
+
             // Capture with html2canvas
             const canvas = await html2canvas(container, {
-                scale: 2, // high quality
+                scale: SCALE,
                 useCORS: true,
                 logging: false,
                 backgroundColor: '#ffffff',
@@ -371,11 +397,32 @@ const SVGPDFRenderer = (() => {
                 windowWidth: contentWpx,
             });
 
-            // Calculate pages
             const imgW = canvas.width;
             const imgH = canvas.height;
-            const pageContentHpx = Math.round(contentH * PX_PER_MM * 2); // scale=2
-            const totalPages = Math.ceil(imgH / pageContentHpx);
+            const pageContentHpx = Math.round(contentH * PX_PER_MM * SCALE);
+
+            // Calculate page break points at row boundaries
+            const breakPoints = [0]; // start of each page in scaled pixels
+            let currentLimit = pageContentHpx;
+
+            for (let i = 0; i < rowBottoms.length; i++) {
+                const rowBottomScaled = rowBottoms[i] * SCALE;
+                if (rowBottomScaled > currentLimit) {
+                    // This row exceeds the page. Break BEFORE this row.
+                    // Find the previous row's bottom as the break point.
+                    const prevBottom = (i > 0) ? rowBottoms[i - 1] * SCALE : 0;
+                    if (prevBottom > breakPoints[breakPoints.length - 1]) {
+                        breakPoints.push(prevBottom);
+                        currentLimit = prevBottom + pageContentHpx;
+                    } else {
+                        // Single row taller than page — force break at page limit
+                        breakPoints.push(currentLimit);
+                        currentLimit += pageContentHpx;
+                    }
+                }
+            }
+
+            const totalPages = breakPoints.length;
 
             const jsPDFLib = window.jspdf || window.jsPDF;
             const doc = new jsPDFLib.jsPDF({
@@ -386,9 +433,9 @@ const SVGPDFRenderer = (() => {
             for (let page = 0; page < totalPages; page++) {
                 if (page > 0) doc.addPage();
 
-                // Slice the canvas for this page
-                const srcY = page * pageContentHpx;
-                const srcH = Math.min(pageContentHpx, imgH - srcY);
+                const srcY = breakPoints[page];
+                const srcEnd = (page + 1 < breakPoints.length) ? breakPoints[page + 1] : imgH;
+                const srcH = srcEnd - srcY;
                 if (srcH <= 0) break;
 
                 const pageCanvas = document.createElement('canvas');
@@ -400,9 +447,22 @@ const SVGPDFRenderer = (() => {
                 ctx.drawImage(canvas, 0, srcY, imgW, srcH, 0, 0, imgW, srcH);
 
                 const imgData = pageCanvas.toDataURL('image/jpeg', 0.92);
-                const sliceHmm = (srcH / (PX_PER_MM * 2));
+                const sliceHmm = (srcH / (PX_PER_MM * SCALE));
 
                 doc.addImage(imgData, 'JPEG', margins.left, margins.top, contentW, sliceHmm);
+
+                // FIX 5: Add seal image on first page (top-right corner of header)
+                if (page === 0 && sealImages.length > 0) {
+                    for (const seal of sealImages) {
+                        try {
+                            const sealW = 18; // mm
+                            const sealH = 18;
+                            const sealX = pw - margins.right - sealW - 2;
+                            const sealY = margins.top + 10;
+                            doc.addImage(seal.dataUrl, 'PNG', sealX, sealY, sealW, sealH);
+                        } catch (e) { /* skip bad images */ }
+                    }
+                }
 
                 // Page number
                 doc.setFontSize(8);
@@ -668,6 +728,65 @@ const SVGPDFRenderer = (() => {
     function escapeHtml(str) {
         if (!str) return '';
         return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // ===== FIX 5: Extract template images (seal/stamp) =====
+
+    async function extractTemplateImages(zip) {
+        const images = [];
+
+        // Find drawing relationships
+        const relsPath = 'xl/worksheets/_rels/sheet1.xml.rels';
+        const relsFile = zip.file(relsPath);
+        if (!relsFile) return images;
+
+        const relsXml = await relsFile.async('string');
+        const relsDoc = new DOMParser().parseFromString(relsXml, 'application/xml');
+        const rels = relsDoc.getElementsByTagName('Relationship');
+
+        // Find drawing file
+        let drawingPath = null;
+        for (let i = 0; i < rels.length; i++) {
+            const type = rels[i].getAttribute('Type') || '';
+            if (type.includes('drawing')) {
+                const target = rels[i].getAttribute('Target') || '';
+                drawingPath = target.startsWith('/') ? target.substring(1) : 'xl/' + target.replace('../', '');
+                break;
+            }
+        }
+        if (!drawingPath) return images;
+
+        // Find drawing rels to get image references
+        const drawingRelsPath = drawingPath.replace('drawings/', 'drawings/_rels/') + '.rels';
+        const drawingRelsFile = zip.file(drawingRelsPath);
+        if (!drawingRelsFile) return images;
+
+        const drawingRelsXml = await drawingRelsFile.async('string');
+        const drawingRelsDoc = new DOMParser().parseFromString(drawingRelsXml, 'application/xml');
+        const imgRels = drawingRelsDoc.getElementsByTagName('Relationship');
+
+        for (let i = 0; i < imgRels.length; i++) {
+            const type = imgRels[i].getAttribute('Type') || '';
+            if (!type.includes('image')) continue;
+
+            const target = imgRels[i].getAttribute('Target') || '';
+            const imgPath = target.startsWith('/') ? target.substring(1) : 'xl/' + target.replace('../', '');
+
+            const imgFile = zip.file(imgPath);
+            if (!imgFile) continue;
+
+            try {
+                const imgData = await imgFile.async('base64');
+                const ext = imgPath.split('.').pop().toLowerCase();
+                const mime = ext === 'png' ? 'image/png' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png';
+                images.push({
+                    dataUrl: `data:${mime};base64,${imgData}`,
+                    path: imgPath,
+                });
+            } catch (e) { /* skip unreadable images */ }
+        }
+
+        return images;
     }
 
     return { renderToPDF };
