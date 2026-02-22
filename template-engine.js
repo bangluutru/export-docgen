@@ -697,6 +697,49 @@ const TemplateEngine = (() => {
             }
         }
 
+        // === Step 5.5: Remove consecutive empty rows from footer ===
+        // The template footer often has large blocks of empty rows (e.g. 備考 note area).
+        // Collapse consecutive empty rows: keep at most 1 spacer between content rows.
+        {
+            const footerStartRn = newDataEnd + 1;
+            const footerRowNodes = [];
+            const allRowNodes = sheetData.getElementsByTagName('row');
+            for (let i = 0; i < allRowNodes.length; i++) {
+                const rn = parseInt(allRowNodes[i].getAttribute('r'), 10);
+                if (rn >= footerStartRn) {
+                    footerRowNodes.push(allRowNodes[i]);
+                }
+            }
+
+            // Check if a row has any cell with actual content
+            const rowHasContent = (rowEl) => {
+                const cells = rowEl.getElementsByTagName('c');
+                for (let j = 0; j < cells.length; j++) {
+                    const v = cells[j].getElementsByTagName('v')[0];
+                    if (v && v.textContent && v.textContent.trim().length > 0) return true;
+                    const f = cells[j].getElementsByTagName('f')[0];
+                    if (f && f.textContent && f.textContent.trim().length > 0) return true;
+                }
+                return false;
+            };
+
+            let consecutiveEmpty = 0;
+            const rowsToRemove = [];
+            for (const rowEl of footerRowNodes) {
+                if (rowHasContent(rowEl)) {
+                    consecutiveEmpty = 0;
+                } else {
+                    consecutiveEmpty++;
+                    if (consecutiveEmpty > 1) {
+                        rowsToRemove.push(rowEl); // Mark for removal
+                    }
+                }
+            }
+            for (const rowEl of rowsToRemove) {
+                sheetData.removeChild(rowEl);
+            }
+        }
+
         // === Step 6: Update merge cells ===
         updateMergeCells(doc, dataStartRowNum, origDataEndRowNum, newDataEnd, origFooterStartRowNum, rowShift);
 

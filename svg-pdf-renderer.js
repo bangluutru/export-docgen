@@ -131,52 +131,33 @@ const SVGPDFRenderer = (() => {
             }
         }
 
-        // Build merge map (must be before footer filter which uses it)
+        // Build merge map
         const mergeMap = buildMergeMap(adjustedMerges);
 
-        // Reference list for origin lookup (includes all rows before filtering)
-        const allFinalRowsRaw = [...headerRows, ...newDataRows, ...shiftedFooter];
+        // DEFINITIVE FIX: Collapse consecutive empty rows.
+        // Previous approaches (merge-aware filter, trailing trim) failed because
+        // empty rows are INSIDE merge cells whose origin has content (e.g. 備考 spans 10 rows).
+        // New approach: simply walk through ALL rows and collapse any run of 2+ consecutive
+        // empty rows into a single spacer. This is universal and handles all cases.
+        const allRowsUnsorted = [...headerRows, ...newDataRows, ...shiftedFooter];
+        allRowsUnsorted.sort((a, b) => a.rowNum - b.rowNum);
 
-        // IMPROVED FIX 4: Aggressively remove empty footer rows
-        // Step A: Filter out rows with no content, being smart about merge cells.
-        // Only preserve a merge-linked row if the merge's ORIGIN cell has content.
-        const filteredFooter = shiftedFooter.filter(row => {
-            // Keep rows that have at least one non-empty cell
-            if (row.cells.some(c => c.display && String(c.display).trim().length > 0)) return true;
+        const hasContent = (row) => row.cells.some(c => c.display && String(c.display).trim().length > 0);
 
-            // Check if this row belongs to a merge whose ORIGIN has content
-            for (const cell of row.cells) {
-                const key = `${row.rowNum},${cell.colNum}`;
-                const merge = mergeMap[key];
-                if (merge && !merge.isOrigin) {
-                    // Find the origin cell's content
-                    const originRow = allFinalRowsRaw.find(r => r.rowNum === merge.startRow);
-                    if (originRow) {
-                        const originCell = originRow.cells.find(c => c.colNum === merge.startCol);
-                        if (originCell && originCell.display && String(originCell.display).trim().length > 0) {
-                            return true; // Origin has content — keep this row
-                        }
-                    }
+        const allFinalRows = [];
+        let consecutiveEmptyCount = 0;
+        for (const row of allRowsUnsorted) {
+            if (hasContent(row)) {
+                consecutiveEmptyCount = 0;
+                allFinalRows.push(row);
+            } else {
+                consecutiveEmptyCount++;
+                if (consecutiveEmptyCount <= 1) {
+                    allFinalRows.push(row); // Keep max 1 spacer row
                 }
-            }
-            return false;
-        });
-
-        // Step B: Trim trailing empty rows. Find last row with actual content,
-        // keep at most 1 empty row after it for spacing.
-        let lastContentIdx = -1;
-        for (let i = filteredFooter.length - 1; i >= 0; i--) {
-            if (filteredFooter[i].cells.some(c => c.display && String(c.display).trim().length > 0)) {
-                lastContentIdx = i;
-                break;
+                // Skip all additional consecutive empty rows
             }
         }
-        const trimmedFooter = lastContentIdx >= 0
-            ? filteredFooter.slice(0, lastContentIdx + 2) // +1 for content row, +1 for spacing
-            : [];
-
-        const allFinalRows = [...headerRows, ...newDataRows, ...trimmedFooter];
-        allFinalRows.sort((a, b) => a.rowNum - b.rowNum);
 
         // 9. Calculate page dimensions (in pixels for HTML)
         const pgBase = PAGE_SIZES[pageSize] || PAGE_SIZES.a4;
